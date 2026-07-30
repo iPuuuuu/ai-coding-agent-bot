@@ -338,7 +338,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     log.info("机器人启动，工作目录=%s", _state.current_cwd)
-    print("🤖 机器人已启动，去 Telegram 给它发消息吧。Ctrl+C 退出。")
+    print("机器人已启动，去 Telegram 给它发消息吧。Ctrl+C 退出。")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

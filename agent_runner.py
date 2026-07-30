@@ -1,55 +1,49 @@
 """
-agent_runner.py —— 封装一次 Agent 对话回合。
+agent_runner.py —— 封装一次 Claude Code CLI 对话回合。
 
 每收到你的一条指令就调用 run_turn()：
-- 打开一个 ClaudeSDKClient（用 continue_conversation 保持上下文连续，实现多轮对话）
-- 挂上 can_use_tool 三档审批回调 + 截图 MCP 工具
-- 流式地把 Agent 的文本/工具动作/结果转发到 Telegram
+- 启动本机 claude CLI 子进程
+- 流式读取 stream-json 输出
+- 把文本/状态/结果转发到 Telegram
+- 支持停止当前任务
 
-如果本机还没安装 claude-agent-sdk，会优雅报错并告诉你下一步怎么装。
+这条路线不再依赖 claude-agent-sdk，避免 pip 依赖链阻塞。
 """
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import channel
-from permissions import can_use_tool
-from tools.screenshot import SCREENSHOT_TOOL_NAMES, screenshot_server
-
-try:
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ClaudeSDKClient,
-        ResultMessage,
-        TextBlock,
-        ToolUseBlock,
-    )
-    SDK_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - 依赖未安装时走这里
-    AssistantMessage = ClaudeAgentOptions = ClaudeSDKClient = None
-    ResultMessage = TextBlock = ToolUseBlock = None
-    SDK_IMPORT_ERROR = exc
+from permissions import build_supervisor_rules_text
+from tools.run_project import detect_run_hint
+from tools.screenshot import maybe_handle_visual_request
 
 SYSTEM_PROMPT = """你是一个常驻在用户家里 Windows 电脑上的编程监督助手，通过 Telegram 和用户沟通。
 原则：
-1. 尽量自主完成任务：读代码、写代码、跑测试、修 bug，并把阶段性进展同步给用户。
-2. 你是在监督/驱动 AI 写代码；用户只有手机 Telegram，所以要主动汇报当前进度、下一步、阻塞点。
-3. 只有遇到真正需要用户拍板的产品决策，或权限系统要求审批的风险操作时，才停下来等用户。
-4. 完成网页或可视化项目后，主动用 screenshot 工具截图给用户看效果。
-5. 回复精炼，适合手机阅读；关键结论优先，不要长篇空话。
-6. 如果你需要用户补充信息，请明确列出你需要什么，并以问句结尾。
+1. 你运行在 Claude Code CLI 中，可以读写代码、运行命令、修改项目。
+2. 用户只有手机 Telegram，所以你要主动汇报当前进度、下一步和阻塞点。
+3. 如果任务涉及高风险操作（例如安装依赖、联网下载、删除文件、git push），不要直接执行；先明确向用户提问，等待用户回复后再继续。
+4. 回答保持精炼，适合手机阅读。
+5. 如果你需要用户补充信息，请明确提出问题，并以问句结尾。
+6. 如果你判断项目适合运行后截图，请在结论里明确说出建议的启动命令或可访问地址。
+
+风险规则：
+{rules}
 """
 
-_seen_cwds: set[str] = set()
 _stop_requested = False
+_last_session_id_by_cwd: dict[str, str] = {}
+_active_process: Optional[asyncio.subprocess.Process] = None
 
 
 @dataclass
 class TurnOutcome:
-    state: str = "completed"  # completed | waiting
+    state: str = "completed"
+    final_text: str = ""
+    session_id: str = ""
 
 
 class AgentRunnerError(RuntimeError):
@@ -59,6 +53,9 @@ class AgentRunnerError(RuntimeError):
 def request_stop():
     global _stop_requested
     _stop_requested = True
+    proc = _active_process
+    if proc and proc.returncode is None:
+        proc.terminate()
 
 
 def _reset_stop_flag():
@@ -66,72 +63,150 @@ def _reset_stop_flag():
     _stop_requested = False
 
 
-def _build_options(cwd: str, first: bool):
-    return ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
-        cwd=cwd,
-        permission_mode="acceptEdits",
-        can_use_tool=can_use_tool,
-        continue_conversation=not first,
-        mcp_servers={"screenshot": screenshot_server},
-        allowed_tools=SCREENSHOT_TOOL_NAMES,
-    )
-
-
 async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
     """跑一回合，把过程流式发到 Telegram。返回 completed/waiting。"""
-    if SDK_IMPORT_ERROR is not None:
-        raise AgentRunnerError(
-            "本机未安装 claude-agent-sdk。先执行：py -3.11 -m pip install -r requirements.txt"
-        ) from SDK_IMPORT_ERROR
-
+    await _ensure_claude_available()
     _reset_stop_flag()
-    first = cwd not in _seen_cwds
-    _seen_cwds.add(cwd)
-    options = _build_options(cwd, first)
-    outcome = TurnOutcome()
 
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(prompt)
-        async for msg in client.receive_response():
+    outcome = TurnOutcome()
+    system_prompt = SYSTEM_PROMPT.format(rules=build_supervisor_rules_text())
+
+    cmd = [
+        "claude",
+        "-p",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "text",
+        "--permission-mode",
+        "dontAsk",
+        "--append-system-prompt",
+        system_prompt,
+        prompt,
+    ]
+
+    session_id = _last_session_id_by_cwd.get(cwd)
+    if is_followup and session_id:
+        cmd[1:1] = ["--resume", session_id]
+
+    global _active_process
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    _active_process = proc
+
+    try:
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
             if _stop_requested:
                 raise asyncio.CancelledError()
-            maybe_waiting = await _forward(msg, is_followup=is_followup)
-            if maybe_waiting:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            waiting = await _handle_stream_line(line, outcome)
+            if waiting:
                 outcome.state = "waiting"
 
-    return outcome.state
+        rc = await proc.wait()
+        if _stop_requested:
+            raise asyncio.CancelledError()
+        if rc != 0:
+            raise AgentRunnerError(f"Claude CLI 退出码 {rc}")
+
+        if outcome.session_id:
+            _last_session_id_by_cwd[cwd] = outcome.session_id
+
+        await _maybe_send_visual_help(prompt, cwd)
+        return outcome.state
+    finally:
+        _active_process = None
 
 
-async def _forward(msg: Any, is_followup: bool = False) -> bool:
-    """把一条 SDK 消息转成人话发到 Telegram。返回是否看起来在等用户。"""
+async def _ensure_claude_available():
+    proc = await asyncio.create_subprocess_exec(
+        "claude",
+        "--version",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        detail = (err or out).decode("utf-8", errors="replace").strip()
+        raise AgentRunnerError(f"本机 Claude CLI 不可用：{detail or '未安装或无法执行 claude'}")
+
+
+async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
     waiting = False
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        await channel.send_text(line)
+        return _looks_like_question(line)
 
-    if AssistantMessage is not None and isinstance(msg, AssistantMessage):
-        for block in getattr(msg, "content", []):
-            if TextBlock is not None and isinstance(block, TextBlock):
-                text = (getattr(block, "text", "") or "").strip()
+    event_type = event.get("type")
+    if event_type == "system" and event.get("subtype") == "init":
+        outcome.session_id = event.get("session_id", "")
+        return False
+
+    if event_type == "assistant":
+        message = event.get("message", {})
+        for block in message.get("content", []):
+            if block.get("type") == "text":
+                text = (block.get("text") or "").strip()
                 if text:
+                    outcome.final_text = text
                     await channel.send_text(text)
                     if _looks_like_question(text):
                         waiting = True
-            elif ToolUseBlock is not None and isinstance(block, ToolUseBlock):
-                tool_name = getattr(block, "name", "工具")
-                await channel.send_status(f"🔧 正在使用工具：{tool_name}")
+        return waiting
 
-    elif ResultMessage is not None and isinstance(msg, ResultMessage):
-        cost = getattr(msg, "total_cost_usd", None)
-        tail = f"（本轮花费约 ${cost:.4f}）" if cost else ""
-        await channel.send_text(f"✅ 本轮处理结束 {tail}")
+    if event_type == "result":
+        outcome.session_id = event.get("session_id", outcome.session_id)
+        result = (event.get("result") or "").strip()
+        if result and result != outcome.final_text:
+            outcome.final_text = result
+            await channel.send_text(result)
+        if event.get("subtype") == "success":
+            await channel.send_text("✅ 本轮处理结束")
+        else:
+            raise AgentRunnerError(result or "Claude CLI 执行失败")
+        return _looks_like_question(result)
 
-    else:
-        text = str(msg).strip()
-        if text:
-            await channel.send_text(text)
-            if _looks_like_question(text):
-                waiting = True
+    if event_type == "user":
+        return False
 
-    return waiting
+    summary = _summarize_event(event)
+    if summary:
+        await channel.send_status(summary)
+    return False
+
+
+async def _maybe_send_visual_help(prompt: str, cwd: str):
+    if not any(word in prompt for word in ["截图", "跑起来", "运行", "效果", "网页"]):
+        return
+    hint = detect_run_hint(cwd)
+    if hint:
+        await channel.send_text(
+            f"💡 我检测到这个项目可能可以这样运行：`{hint.command}`"
+            + (f"\n可能地址：{hint.url_hint}" if hint.url_hint else "")
+            + (f"\n依据：{hint.reason}" if hint.reason else "")
+        )
+    await maybe_handle_visual_request(prompt)
+
+
+def _summarize_event(event: dict) -> str:
+    event_type = event.get("type")
+    if event_type == "system":
+        subtype = event.get("subtype")
+        if subtype and subtype != "init":
+            return f"ℹ️ {subtype}"
+    if event_type and event_type not in {"assistant", "result", "user"}:
+        return f"🔧 事件：{event_type}"
+    return ""
 
 
 def _looks_like_question(text: str) -> bool:
