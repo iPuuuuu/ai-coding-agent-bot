@@ -11,28 +11,24 @@ DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", os.getcwd())
 APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT", "300"))
 APPROVAL_TIMEOUT_ACTION = os.getenv("APPROVAL_TIMEOUT_ACTION", "deny").lower()
 
-# 让 SDK 能读到 key（SDK 会读环境变量 ANTHROPIC_API_KEY）
 if ANTHROPIC_API_KEY:
     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
 
 # ============ 权限三档分级规则（permissions.py 用）============
 
-# 🟢 绿灯：这些工具永远自动放行（只读 + 项目内编辑）
-GREEN_TOOLS = {"Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit", "TodoWrite"}
+GREEN_TOOLS = {"Read", "Grep", "Glob", "Edit", "Write", "NotebookEdit"}
 
-# 🔴 红灯：Bash 命令里出现这些关键词 → 直接拒绝，连问都不问
 RED_KEYWORDS = [
     "rm -rf /", "rm -rf ~", ":(){", "mkfs", "format ", "del /f /s",
     "shutdown", "reg delete", "diskpart", "> /dev/sda",
 ]
 
-# 🟡 黄灯：Bash 命令里出现这些关键词 → 发 Telegram 问你（带超时默认）
 YELLOW_KEYWORDS = [
-    "rm ", "rmdir", "del ", "mv ", "move ",           # 删除/移动
-    "pip install", "npm install", "npm i ", "yarn add", "conda install", "apt ", "choco ",  # 装依赖
-    "git push", "git reset --hard", "git clean",       # 有破坏性的 git
-    "curl ", "wget ", "Invoke-WebRequest",             # 联网下载
-    "chmod", "chown", "runas", "sudo ",                # 权限相关
+    "rm ", "rmdir", "del ", "mv ", "move ",
+    "pip install", "npm install", "npm i ", "yarn add", "conda install", "apt ", "choco ",
+    "git push", "git reset --hard", "git clean",
+    "curl ", "wget ", "Invoke-WebRequest",
+    "chmod", "chown", "runas", "sudo ",
 ]
 
 
@@ -44,3 +40,14 @@ def validate() -> list[str]:
     if not ALLOWED_CHAT_ID:
         missing.append("ALLOWED_CHAT_ID")
     return missing
+
+
+def format_missing_config(missing: list[str]) -> str:
+    fields = ", ".join(missing)
+    return (
+        f"❌ .env 缺少必填项：{fields}\n"
+        "请先复制 .env.example 为 .env，并填写 Telegram token 与你的 chat_id。\n"
+        "如果还没拿到 chat_id：先用手机给 bot 发条消息，再打开\n"
+        "https://api.telegram.org/bot<你的TOKEN>/getUpdates\n"
+        "在返回 JSON 里找 chat.id。"
+    )

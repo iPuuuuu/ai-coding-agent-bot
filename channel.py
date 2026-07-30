@@ -8,13 +8,15 @@ permissions.py 和 tools/ 都从这里拿"发消息 / 发图 / 问用户"的能�
 bot.py 启动时调用 init() 把 Bot 对象和你的 chat_id 注入进来。
 """
 import asyncio
+import time
 import uuid
 
 _bot = None            # telegram.Bot 实例
 _chat_id = None        # 你的 chat_id（只给你发）
 
-# 挂起中的黄灯审批：approval_id -> asyncio.Future[bool]
 _pending: dict[str, asyncio.Future] = {}
+_last_status_text = ""
+_last_status_at = 0.0
 
 
 def init(bot, chat_id: int):
@@ -27,17 +29,25 @@ def init(bot, chat_id: int):
 
 async def send_text(text: str):
     """发文字。Telegram 单条上限 4096 字符，自动分段。"""
-    if not _bot:
-        return
-    if not text:
+    if not _bot or not text:
         return
     for i in range(0, len(text), 3800):
         chunk = text[i:i + 3800]
         try:
             await _bot.send_message(chat_id=_chat_id, text=chunk)
         except Exception:
-            # 富文本失败就退化成纯文本，别让发消息把主流程搞崩
             pass
+
+
+async def send_status(text: str, min_interval: float = 2.5):
+    """发阶段性状态，做一点节流，避免工具消息刷屏。"""
+    global _last_status_text, _last_status_at
+    now = time.time()
+    if text == _last_status_text and (now - _last_status_at) < min_interval:
+        return
+    _last_status_text = text
+    _last_status_at = now
+    await send_text(text)
 
 
 async def send_photo(path: str, caption: str = ""):
