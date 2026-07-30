@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,6 +38,10 @@ SYSTEM_PROMPT = """你是一个常驻在用户家里 Windows 电脑上的编程�
 _stop_requested = False
 _last_session_id_by_cwd: dict[str, str] = {}
 _active_process: Optional[asyncio.subprocess.Process] = None
+
+
+def _claude_command() -> str:
+    return "claude.cmd" if os.name == "nt" else "claude"
 
 
 @dataclass
@@ -72,7 +77,7 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
     system_prompt = SYSTEM_PROMPT.format(rules=build_supervisor_rules_text())
 
     cmd = [
-        "claude",
+        _claude_command(),
         "-p",
         "--verbose",
         "--output-format",
@@ -128,7 +133,7 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
 
 async def _ensure_claude_available():
     proc = await asyncio.create_subprocess_exec(
-        "claude",
+        _claude_command(),
         "--version",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
