@@ -42,9 +42,24 @@ _active_process: Optional[asyncio.subprocess.Process] = None
 
 
 def _claude_command() -> str:
-    command_name = "claude.cmd" if os.name == "nt" else "claude"
-    resolved = shutil.which(command_name)
-    return resolved or command_name
+    if os.name != "nt":
+        return shutil.which("claude") or "claude"
+
+    cmd_path = shutil.which("claude.cmd")
+    if cmd_path:
+        exe_path = os.path.join(
+            os.path.dirname(cmd_path),
+            "node_modules",
+            "@anthropic-ai",
+            "claude-code",
+            "bin",
+            "claude.exe",
+        )
+        if os.path.exists(exe_path):
+            return exe_path
+        return cmd_path
+
+    return "claude.cmd"
 
 
 @dataclass
