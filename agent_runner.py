@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from typing import Optional
 
@@ -41,7 +42,9 @@ _active_process: Optional[asyncio.subprocess.Process] = None
 
 
 def _claude_command() -> str:
-    return "claude.cmd" if os.name == "nt" else "claude"
+    command_name = "claude.cmd" if os.name == "nt" else "claude"
+    resolved = shutil.which(command_name)
+    return resolved or command_name
 
 
 @dataclass
@@ -75,9 +78,10 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
 
     outcome = TurnOutcome()
     system_prompt = SYSTEM_PROMPT.format(rules=build_supervisor_rules_text())
+    command = _claude_command()
 
     cmd = [
-        _claude_command(),
+        command,
         "-p",
         "--verbose",
         "--output-format",
@@ -96,12 +100,15 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
         cmd[1:1] = ["--resume", session_id]
 
     global _active_process
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError as exc:
+        raise AgentRunnerError(f"启动 Claude CLI 失败：找不到可执行文件 {command}") from exc
     _active_process = proc
 
     try:
@@ -132,16 +139,20 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
 
 
 async def _ensure_claude_available():
-    proc = await asyncio.create_subprocess_exec(
-        _claude_command(),
-        "--version",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    command = _claude_command()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            command,
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise AgentRunnerError(f"本机 Claude CLI 不可用：找不到可执行文件 {command}") from exc
     out, err = await proc.communicate()
     if proc.returncode != 0:
         detail = (err or out).decode("utf-8", errors="replace").strip()
-        raise AgentRunnerError(f"本机 Claude CLI 不可用：{detail or '未安装或无法执行 claude'}")
+        raise AgentRunnerError(f"本机 Claude CLI 不可用：{detail or f'无法执行 {command}'}")
 
 
 async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
