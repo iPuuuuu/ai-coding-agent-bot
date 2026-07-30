@@ -1,7 +1,7 @@
-# 需要 Python 3.10+（本机用 `py -3.11`）
+# Requires Python 3.10+
 claude-agent-sdk>=0.1.0
 python-telegram-bot>=21.0
 python-dotenv>=1.0.0
 mss>=9.0.0
 playwright>=1.40.0
-# 装完 playwright 后还要跑一次： py -3.11 -m playwright install chromium
+# After install, run: py -3.11 -m playwright install chromium
