@@ -10,6 +10,7 @@ bot.py —— 主入口：Telegram 桥接层。
 运行：  py -3.11 bot.py
 """
 import asyncio
+import json
 import logging
 import os
 import time
@@ -368,6 +369,8 @@ class RuntimeState:
             lines.append(self.projects[path].summary_line(is_active=(path == current_norm)))
         if self.sessions:
             lines.append(self.session_summary())
+        lines.append("全局 Claude 会话：")
+        lines.extend(_format_global_sessions())
         snap = self.ensure_project(self.current_cwd)
         if snap.transcript:
             lines.append("最近窗口：")
@@ -394,6 +397,38 @@ def _resolve_session_id(prefix: str) -> str:
         if session_id.startswith(prefix):
             return session_id
     return ""
+
+
+def _load_global_sessions() -> dict[str, dict]:
+    path = config.SESSION_SNAPSHOT_FILE
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    sessions = data.get("sessions", {})
+    return sessions if isinstance(sessions, dict) else {}
+
+
+def _format_global_sessions(limit: int = 8) -> list[str]:
+    sessions = _load_global_sessions()
+    if not sessions:
+        return ["暂无全局 Claude 会话记录。"]
+    items = sorted(
+        sessions.values(),
+        key=lambda item: item.get("updated_at", 0),
+        reverse=True,
+    )[:limit]
+    lines = []
+    for item in items:
+        cwd = _project_label(item.get("cwd", ""))
+        session_id = str(item.get("session_id", ""))[:8] or "-"
+        status = item.get("status", "unknown")
+        last_event = str(item.get("last_event", ""))[:28]
+        lines.append(f"• {session_id} | {cwd} | {status} | {last_event}")
+    return lines
 
 
 _state = RuntimeState()
@@ -546,7 +581,8 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         await _send_unauthorized(update)
         return
-    await update.message.reply_text(_state.session_summary())
+    text = _state.session_summary() + "\n\n全局 Claude 会话：\n" + "\n".join(_format_global_sessions())
+    await update.message.reply_text(text)
 
 
 async def cmd_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

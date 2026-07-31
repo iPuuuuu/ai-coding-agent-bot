@@ -20,6 +20,13 @@ if DEFAULT_PROJECT_DIR not in DEFAULT_PROJECTS:
     DEFAULT_PROJECTS.insert(0, DEFAULT_PROJECT_DIR)
 APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT", "300"))
 APPROVAL_TIMEOUT_ACTION = os.getenv("APPROVAL_TIMEOUT_ACTION", "deny").lower()
+SESSION_MONITOR_DIR = os.getenv(
+    "SESSION_MONITOR_DIR",
+    "C:/Users/wmh/.claude/session-monitor",
+)
+SESSION_EVENT_LOG = os.path.join(SESSION_MONITOR_DIR, "events.jsonl")
+SESSION_SNAPSHOT_FILE = os.path.join(SESSION_MONITOR_DIR, "sessions.json")
+GLOBAL_HOOK_SCRIPT = os.path.join(DEFAULT_PROJECT_DIR, "tools", "claude_session_hook.py")
 
 if ANTHROPIC_API_KEY:
     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
