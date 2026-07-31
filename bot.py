@@ -3,7 +3,7 @@ bot.py —— 主入口：Telegram 桥接层。
 
 职责：
 - 收你的文字消息 → 交给 Agent 跑（新任务 / 继续回答）
-- 处理 ✅/❌ 审批按钮 → 唤醒挂起的审批
+- 处理按钮选择 → 唤醒挂起的交互
 - 命令：/start /project /status /stop /help
 - 白名单：只有你的 chat_id 能指挥
 
@@ -42,6 +42,24 @@ log = logging.getLogger("bot")
 
 
 @dataclass
+class TranscriptEntry:
+    kind: str
+    text: str
+    session_id: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class PendingInteraction:
+    project_path: str
+    project_label: str
+    session_id: str
+    prompt_text: str
+    options: list[str] = field(default_factory=list)
+    source: str = "text"  # text | buttons
+
+
+@dataclass
 class ProjectSnapshot:
     path: str
     label: str
@@ -52,15 +70,15 @@ class ProjectSnapshot:
     active_prompt: str = ""
     last_task_id: Optional[int] = None
     last_active_at: Optional[float] = None
-    history: list[str] = field(default_factory=list)
+    transcript: list[TranscriptEntry] = field(default_factory=list)
 
-    def push(self, text: str):
+    def add_entry(self, kind: str, text: str, session_id: str = ""):
         text = text.strip()
         if not text:
             return
-        self.history.append(text)
-        if len(self.history) > 10:
-            self.history = self.history[-10:]
+        self.transcript.append(TranscriptEntry(kind=kind, text=text, session_id=session_id))
+        if len(self.transcript) > 80:
+            self.transcript = self.transcript[-80:]
 
     def summary_line(self, is_active: bool = False) -> str:
         marker = "👉" if is_active else "•"
@@ -73,7 +91,7 @@ class ProjectSnapshot:
 @dataclass
 class RuntimeState:
     current_cwd: str = config.DEFAULT_PROJECT_DIR
-    mode: str = "idle"  # idle | running | waiting_user_reply
+    mode: str = "idle"
     active_prompt: str = ""
     started_at: Optional[float] = None
     last_event: str = "空闲"
@@ -83,8 +101,8 @@ class RuntimeState:
     task_counter: int = 0
     current_task_id: Optional[int] = None
     current_project_label: str = ""
-    history: list[str] = field(default_factory=list)
     projects: dict[str, ProjectSnapshot] = field(default_factory=dict)
+    pending: Optional[PendingInteraction] = None
 
     def ensure_project(self, path: str) -> ProjectSnapshot:
         norm = _norm_path(path)
@@ -100,10 +118,9 @@ class RuntimeState:
         self.current_cwd = norm
         self.current_project_label = snap.label
         self.last_event = f"切换项目：{snap.label}"
-        self._push_history(self.last_event)
         snap.last_event = self.last_event
         snap.last_active_at = time.time()
-        snap.push(self.last_event)
+        snap.add_entry("system", self.last_event)
 
     def start_task(self, prompt: str):
         self.task_counter += 1
@@ -114,10 +131,10 @@ class RuntimeState:
         self.stop_requested = False
         self.waiting_reason = ""
         self.last_error = ""
+        self.pending = None
         snap = self.ensure_project(self.current_cwd)
         self.current_project_label = snap.label
         self.last_event = f"{snap.label} 开始处理"
-        self._push_history(f"任务 #{self.current_task_id} 开始：{snap.label} {self.active_prompt[:80]}")
         snap.mode = "running"
         snap.last_event = self.last_event
         snap.last_error = ""
@@ -125,31 +142,30 @@ class RuntimeState:
         snap.active_prompt = self.active_prompt
         snap.last_task_id = self.current_task_id
         snap.last_active_at = self.started_at
-        snap.push(f"开始：{self.active_prompt[:60]}")
+        snap.add_entry("user", self.active_prompt)
 
-    def mark_waiting(self, reason: str):
-        snap = self.ensure_project(self.current_cwd)
+    def mark_waiting(self, pending: PendingInteraction):
+        snap = self.ensure_project(pending.project_path)
         self.mode = "waiting_user_reply"
-        self.waiting_reason = reason.strip() or "Agent 等待你的回复"
-        self.last_event = self.waiting_reason
-        self._push_history(self.waiting_reason)
+        self.pending = pending
+        self.current_cwd = pending.project_path
+        self.current_project_label = pending.project_label
+        self.waiting_reason = pending.prompt_text[:120]
+        self.last_event = f"{pending.project_label} 等待你的回复"
         snap.mode = "waiting_user_reply"
         snap.waiting_reason = self.waiting_reason
-        snap.last_event = self.waiting_reason
+        snap.last_event = self.last_event
         snap.last_active_at = time.time()
-        snap.push(self.waiting_reason)
 
     def mark_running(self, event: str):
         snap = self.ensure_project(self.current_cwd)
         self.mode = "running"
         self.waiting_reason = ""
         self.last_event = event
-        self._push_history(event)
         snap.mode = "running"
         snap.waiting_reason = ""
         snap.last_event = event
         snap.last_active_at = time.time()
-        snap.push(event)
 
     def mark_done(self, event: str = "任务完成"):
         snap = self.ensure_project(self.current_cwd)
@@ -160,13 +176,13 @@ class RuntimeState:
         self.started_at = None
         self.stop_requested = False
         self.current_task_id = None
-        self._push_history(event)
+        self.pending = None
         snap.mode = "idle"
         snap.last_event = event
         snap.waiting_reason = ""
         snap.active_prompt = ""
         snap.last_active_at = time.time()
-        snap.push(event)
+        snap.add_entry("system", event)
 
     def mark_error(self, error: str):
         snap = self.ensure_project(self.current_cwd)
@@ -178,22 +194,28 @@ class RuntimeState:
         self.started_at = None
         self.stop_requested = False
         self.current_task_id = None
-        self._push_history(error)
+        self.pending = None
         snap.mode = "idle"
         snap.last_error = error
         snap.last_event = error
         snap.waiting_reason = ""
         snap.active_prompt = ""
         snap.last_active_at = time.time()
-        snap.push(error)
+        snap.add_entry("error", error)
 
     def request_stop(self):
         snap = self.ensure_project(self.current_cwd)
         self.stop_requested = True
         self.last_event = "用户请求停止当前任务"
-        self._push_history(self.last_event)
         snap.last_event = self.last_event
-        snap.push(self.last_event)
+        snap.add_entry("system", self.last_event)
+
+    def append_events(self, project_path: str, events: list[agent_runner.MirrorEvent]):
+        snap = self.ensure_project(project_path)
+        for event in events:
+            snap.add_entry(event.kind, event.text, event.session_id)
+            if event.session_id:
+                snap.last_active_at = time.time()
 
     def summary(self) -> str:
         duration = "-"
@@ -202,26 +224,22 @@ class RuntimeState:
         task_label = f"#{self.current_task_id}" if self.current_task_id else "无"
         prompt = self.active_prompt[:80] if self.active_prompt else "-"
         wait = self.waiting_reason or "-"
-        err = self.last_error or "-"
         lines = [
             f"当前项目：{self.current_project_label or _project_label(self.current_cwd)}",
             f"状态：{self.mode} | 当前任务：{task_label} | 持续：{duration}",
             f"任务内容：{prompt}",
             f"等待原因：{wait}",
-            f"最近错误：{err}",
             "项目面板：",
         ]
         current_norm = _norm_path(self.current_cwd)
         for path in sorted(self.projects):
             lines.append(self.projects[path].summary_line(is_active=(path == current_norm)))
+        snap = self.ensure_project(self.current_cwd)
+        if snap.transcript:
+            lines.append("最近窗口：")
+            for entry in snap.transcript[-6:]:
+                lines.append(f"- [{entry.kind}] {entry.text[:100]}")
         return "\n".join(lines)
-
-    def _push_history(self, text: str):
-        text = text.strip()
-        if text:
-            self.history.append(text)
-            if len(self.history) > 20:
-                self.history = self.history[-20:]
 
 
 def _norm_path(path: str) -> str:
@@ -252,30 +270,55 @@ async def _send_unauthorized(update: Update):
         await update.callback_query.answer("⛔ 未授权", show_alert=True)
 
 
-async def _run_agent(prompt: str, is_followup: bool):
-    project_label = _state.current_project_label or _project_label(_state.current_cwd)
+async def _run_agent(prompt: str, is_followup: bool, project_path: str):
+    global _current_task
+    snap = _state.ensure_project(project_path)
     try:
-        outcome = await agent_runner.run_turn(prompt, _state.current_cwd, is_followup=is_followup)
-        if outcome == "waiting":
-            reason = f"{project_label} 需要你回复后继续。"
-            _state.mark_waiting(reason)
-            await channel.send_text(f"需要你操作：{reason}")
+        outcome = await agent_runner.run_turn(prompt, project_path, is_followup=is_followup)
+        _state.append_events(project_path, outcome.events)
+        if outcome.state == "waiting":
+            pending = PendingInteraction(
+                project_path=project_path,
+                project_label=snap.label,
+                session_id=outcome.session_id,
+                prompt_text=outcome.waiting_text or "Claude 正在等待你的回复",
+                options=outcome.choice_options,
+                source="buttons" if outcome.choice_options else "text",
+            )
+            _state.mark_waiting(pending)
+            if pending.options:
+                choice = await channel.ask_choice(
+                    f"{pending.project_label} 有选项要你选：\n\n{pending.prompt_text}",
+                    pending.options,
+                    timeout=config.APPROVAL_TIMEOUT,
+                )
+                if choice is None:
+                    _state.mark_waiting(pending)
+                    await channel.send_text(f"{pending.project_label} 选择超时，你也可以直接发文字继续。")
+                else:
+                    snap.add_entry("user/choice", choice, pending.session_id)
+                    _state.mark_running(f"收到你的选择：{choice}")
+                    await channel.send_text(f"你选择了：{choice}\n继续处理 {pending.project_label}…")
+                    _current_task = asyncio.create_task(_run_agent(choice, True, project_path))
+                    return
+            else:
+                await channel.send_text(f"{pending.project_label} 正在等你回复。")
         elif _state.stop_requested:
             _state.mark_done("任务已停止")
-            await channel.send_text(f"{project_label} 已停止。")
+            await channel.send_text(f"{snap.label} 已停止。")
         else:
             _state.mark_done("任务完成")
     except asyncio.CancelledError:
         _state.mark_done("任务已取消")
-        await channel.send_text(f"{project_label} 已取消。")
+        await channel.send_text(f"{snap.label} 已取消。")
         raise
     except Exception as e:
         log.exception("run_agent failed")
         _state.mark_error(f"Agent 运行出错：{type(e).__name__}: {e}")
-        await channel.send_text(f"{project_label} 出错：{type(e).__name__}: {e}")
+        await channel.send_text(f"{snap.label} 出错：{type(e).__name__}: {e}")
     finally:
-        global _current_task
-        _current_task = None
+        if _current_task is not None and _current_task.done():
+            _current_task = None
 
 
 # ---------------- 命令 ----------------
@@ -286,11 +329,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     projects = "\n".join(f"- {snap.label}: {snap.path}" for snap in _state.projects.values())
     await update.message.reply_text(
-        "编程监督机器人已上线。\n\n"
+        "Claude 窗口镜像机器人已上线。\n\n"
         f"当前项目：{_state.current_project_label}\n"
         "监控项目：\n"
         f"{projects}\n\n"
-        "直接发任务即可；/status 看双项目状态；/project 切换项目；/stop 停止当前任务。"
+        "直接发任务即可；/status 看项目面板和最近窗口；/project 切换项目；/stop 停止当前任务。"
     )
 
 
@@ -352,13 +395,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "直接发文字 = 给当前项目下任务\n"
         "/project <bot|doctor-wang|路径> 切项目\n"
-        "/status 查看双项目面板\n"
+        "/status 查看项目面板 + 最近窗口\n"
         "/stop 停止当前任务\n"
-        "如果我需要你决定，我会立即发消息提醒你。"
+        "如果 Claude 给出几个选项，我会优先发按钮让你点。"
     )
 
 
-# ---------------- 审批按钮回调 ----------------
+# ---------------- 按钮回调 ----------------
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
@@ -366,15 +409,24 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     query = update.callback_query
     await query.answer()
-    result = channel.resolve_approval(query.data)
-    if result is None:
+    choice = channel.resolve_approval(query.data)
+    if choice is None:
         await query.edit_message_text(query.message.text + "\n\n（已失效/超时）")
-    else:
-        action_text = "你点了通过，任务继续执行" if result else "你点了拒绝，任务将跳过或停止该步骤"
-        _state.last_event = action_text
-        _state._push_history(action_text)
-        _state.ensure_project(_state.current_cwd).push(action_text)
-        await query.edit_message_text(query.message.text + f"\n\n{action_text}")
+        return
+
+    pending = _state.pending
+    if pending is None:
+        await query.edit_message_text(query.message.text + "\n\n（没有待处理的问题了）")
+        return
+
+    snap = _state.ensure_project(pending.project_path)
+    snap.add_entry("user/choice", choice, pending.session_id)
+    _state.set_current_project(pending.project_path)
+    _state.mark_running(f"收到你的选择：{choice}")
+    await query.edit_message_text(query.message.text + f"\n\n你选择了：{choice}")
+
+    global _current_task
+    _current_task = asyncio.create_task(_run_agent(choice, True, pending.project_path))
 
 
 # ---------------- 普通消息 = 新任务 / 继续回答 ----------------
@@ -394,10 +446,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("当前任务还在执行。等它结束，或 /stop 后再发新任务。")
             return
 
-        is_followup = _state.mode == "waiting_user_reply"
+        pending = _state.pending
+        is_followup = _state.mode == "waiting_user_reply" and pending is not None
         if is_followup:
-            _state.mark_running(f"收到你的回复，继续处理 {_state.current_project_label}")
-            await update.message.reply_text(f"继续处理：{_state.current_project_label}")
+            _state.set_current_project(pending.project_path)
+            _state.ensure_project(pending.project_path).add_entry("user", prompt, pending.session_id)
+            _state.mark_running(f"收到你的回复，继续处理 {pending.project_label}")
+            await update.message.reply_text(f"继续处理：{pending.project_label}")
+            target_path = pending.project_path
         else:
             _state.start_task(prompt)
             await update.message.reply_text(
@@ -405,8 +461,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"项目：{_state.current_project_label}\n"
                 f"内容：{prompt[:120]}"
             )
+            target_path = _state.current_cwd
 
-        _current_task = asyncio.create_task(_run_agent(prompt, is_followup=is_followup))
+        _current_task = asyncio.create_task(_run_agent(prompt, is_followup=is_followup, project_path=target_path))
 
 
 # ---------------- 启动 ----------------

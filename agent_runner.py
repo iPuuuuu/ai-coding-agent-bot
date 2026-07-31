@@ -14,12 +14,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 import channel
-import config
 from permissions import build_supervisor_rules_text
 from tools.run_project import detect_run_hint
 from tools.screenshot import maybe_handle_visual_request
@@ -29,9 +30,9 @@ SYSTEM_PROMPT = """你是一个常驻在用户家里 Windows 电脑上的编程�
 1. 你运行在 Claude Code CLI 中，可以读写代码、运行命令、修改项目。
 2. 用户只有手机 Telegram，所以你要主动汇报当前进度、下一步和阻塞点。
 3. 如果任务涉及高风险操作（例如安装依赖、联网下载、删除文件、git push），不要直接执行；先明确向用户提问，等待用户回复后再继续。
-4. 回答保持精炼，适合手机阅读：先给一句结论，再给最多 4 个短要点。
-5. 不要重复上下文；除非有新信息，不要把同一结论说两遍。
-6. 如果你需要用户补充信息，请明确提出问题，并以“需要你决定/请回复我”结尾。
+4. 你的输出会被转发到 Telegram，尽量保持结构清楚。
+5. 如果需要用户做选择，请尽量列出清楚的候选项（例如 1. / 2. / 3.）。
+6. 如果你需要用户补充信息，请直接提问。
 7. 如果你判断项目适合运行后截图，请在结论里明确说出建议的启动命令或可访问地址。
 
 风险规则：
@@ -43,28 +44,12 @@ _last_session_id_by_cwd: dict[str, str] = {}
 _active_process: Optional[asyncio.subprocess.Process] = None
 
 
-RISK_KEYWORDS = tuple(k.lower() for k in config.YELLOW_KEYWORDS)
-
-
-def _claude_command() -> str:
-    if os.name != "nt":
-        return shutil.which("claude") or "claude"
-
-    cmd_path = shutil.which("claude.cmd")
-    if cmd_path:
-        exe_path = os.path.join(
-            os.path.dirname(cmd_path),
-            "node_modules",
-            "@anthropic-ai",
-            "claude-code",
-            "bin",
-            "claude.exe",
-        )
-        if os.path.exists(exe_path):
-            return exe_path
-        return cmd_path
-
-    return "claude.cmd"
+@dataclass
+class MirrorEvent:
+    kind: str
+    text: str
+    session_id: str = ""
+    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -72,9 +57,9 @@ class TurnOutcome:
     state: str = "completed"
     final_text: str = ""
     session_id: str = ""
-    action_required: bool = False
-    action_text: str = ""
-    progress_sent: bool = False
+    waiting_text: str = ""
+    choice_options: list[str] = field(default_factory=list)
+    events: list[MirrorEvent] = field(default_factory=list)
 
 
 class AgentRunnerError(RuntimeError):
@@ -94,8 +79,8 @@ def _reset_stop_flag():
     _stop_requested = False
 
 
-async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
-    """跑一回合，把过程流式发到 Telegram。返回 completed/waiting。"""
+async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> TurnOutcome:
+    """跑一回合，把过程镜像发到 Telegram。"""
     await _ensure_claude_available()
     _reset_stop_flag()
 
@@ -139,7 +124,7 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
         async for raw in proc.stdout:
             if _stop_requested:
                 raise asyncio.CancelledError()
-            line = raw.decode("utf-8", errors="replace").strip()
+            line = raw.decode("utf-8", errors="replace").rstrip()
             if not line:
                 continue
             waiting = await _handle_stream_line(line, outcome)
@@ -156,7 +141,7 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
             _last_session_id_by_cwd[cwd] = outcome.session_id
 
         await _maybe_send_visual_help(prompt, cwd)
-        return outcome.state
+        return outcome
     finally:
         _active_process = None
 
@@ -179,47 +164,69 @@ async def _ensure_claude_available():
 
 
 async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
-    waiting = False
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
+        outcome.events.append(MirrorEvent(kind="raw/non_json", text=line, session_id=outcome.session_id))
+        await channel.send_text(line)
         return False
 
     event_type = event.get("type")
     if event_type == "system" and event.get("subtype") == "init":
         outcome.session_id = event.get("session_id", "")
+        outcome.events.append(MirrorEvent(kind="system/init", text=f"session={outcome.session_id}", session_id=outcome.session_id))
+        await channel.send_status(f"会话已建立：{outcome.session_id[:8]}")
         return False
 
     if event_type == "assistant":
-        text = _extract_text(event.get("message", {}))
-        if not text:
-            return False
-        waiting = _is_action_required(text)
-        if waiting:
-            outcome.action_required = True
-            outcome.action_text = text
-            outcome.final_text = text
-            await channel.send_text(f"需要你操作：{_compact_text(text, 280)}")
-        elif not outcome.progress_sent:
-            outcome.progress_sent = True
-            await channel.send_status("处理中…")
-        return waiting
+        message = event.get("message", {})
+        session_id = event.get("session_id", outcome.session_id)
+        text = _extract_text(message)
+        thinking = _extract_thinking(message)
+        if thinking:
+            outcome.events.append(MirrorEvent(kind="assistant/thinking", text=thinking, session_id=session_id))
+            await channel.send_status(f"思考中：{thinking[:120]}")
+        if text:
+            outcome.events.append(MirrorEvent(kind="assistant/text", text=text, session_id=session_id))
+            await channel.send_text(text)
+            options = _parse_options(text)
+            if options:
+                outcome.waiting_text = text
+                outcome.choice_options = options
+                return True
+            if _looks_like_question(text):
+                outcome.waiting_text = text
+                return True
+        return False
 
     if event_type == "result":
-        outcome.session_id = event.get("session_id", outcome.session_id)
-        result = _compact_text((event.get("result") or "").strip(), 700)
+        session_id = event.get("session_id", outcome.session_id)
+        outcome.session_id = session_id
+        result = (event.get("result") or "").strip()
+        subtype = event.get("subtype") or ""
+        kind = f"result/{subtype or 'unknown'}"
         if result:
             outcome.final_text = result
-        if event.get("subtype") == "success":
-            if outcome.action_required:
-                return True
-            if result:
+            outcome.events.append(MirrorEvent(kind=kind, text=result, session_id=session_id))
+            if subtype == "success":
                 await channel.send_text(result)
-            return _is_action_required(result)
-        raise AgentRunnerError(result or "Claude CLI 执行失败")
+                options = _parse_options(result)
+                if options:
+                    outcome.waiting_text = result
+                    outcome.choice_options = options
+                    return True
+                if _looks_like_question(result):
+                    outcome.waiting_text = result
+                    return True
+            else:
+                raise AgentRunnerError(result)
+        elif subtype != "success":
+            raise AgentRunnerError("Claude CLI 执行失败")
+        return False
 
     summary = _summarize_event(event)
     if summary:
+        outcome.events.append(MirrorEvent(kind=f"system/{event_type}", text=summary, session_id=outcome.session_id))
         await channel.send_status(summary)
     return False
 
@@ -246,53 +253,54 @@ def _extract_text(message: dict) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _compact_text(text: str, limit: int) -> str:
-    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
+def _extract_thinking(message: dict) -> str:
+    parts = []
+    for block in message.get("content", []):
+        if block.get("type") == "thinking":
+            text = (block.get("thinking") or "").strip()
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts).strip()
 
 
-def _is_action_required(text: str) -> bool:
-    if not text:
-        return False
-    low = text.lower()
-    ask_markers = [
-        "需要你",
-        "请回复我",
-        "请告诉我",
-        "请选择",
-        "你希望",
-        "你要",
-        "do you want",
-        "would you like",
-        "please tell me",
-    ]
-    if any(marker in low for marker in ask_markers):
-        return True
-    if any(word in low for word in RISK_KEYWORDS):
-        return True
-    return False
+def _parse_options(text: str) -> list[str]:
+    options = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^(\d+[\).]|[A-Da-d][\).]|[-*•])\s+", line):
+            cleaned = re.sub(r"^(\d+[\).]|[A-Da-d][\).]|[-*•])\s+", "", line).strip()
+            if cleaned:
+                options.append(cleaned[:60])
+    deduped = []
+    for option in options:
+        if option not in deduped:
+            deduped.append(option)
+    return deduped[:4] if 2 <= len(deduped) <= 4 else []
 
 
 def _summarize_event(event: dict) -> str:
     event_type = event.get("type")
     if event_type == "system":
         subtype = event.get("subtype")
-        if subtype in {"thinking", "thinking_tokens", "init"}:
+        if subtype in {"init", "thinking_tokens"}:
             return ""
+        if subtype == "thinking":
+            return "Claude 正在思考…"
         if subtype:
-            return f"状态：{subtype}"
+            return f"系统事件：{subtype}"
     if event_type in {"assistant", "result", "user"}:
         return ""
     if event_type:
-        return f"状态：{event_type}"
+        return f"事件：{event_type}"
     return ""
 
 
 def _looks_like_question(text: str) -> bool:
     low = text.lower()
-    question_mark = "?" in text or "？" in text
+    if "?" in text or "？" in text:
+        return True
     ask_words = [
         "你希望",
         "请选择",
@@ -307,4 +315,25 @@ def _looks_like_question(text: str) -> bool:
         "请回复我",
         "需要你决定",
     ]
-    return question_mark or any(word in low for word in ask_words)
+    return any(word in low for word in ask_words)
+
+
+def _claude_command() -> str:
+    if os.name != "nt":
+        return shutil.which("claude") or "claude"
+
+    cmd_path = shutil.which("claude.cmd")
+    if cmd_path:
+        exe_path = os.path.join(
+            os.path.dirname(cmd_path),
+            "node_modules",
+            "@anthropic-ai",
+            "claude-code",
+            "bin",
+            "claude.exe",
+        )
+        if os.path.exists(exe_path):
+            return exe_path
+        return cmd_path
+
+    return "claude.cmd"
