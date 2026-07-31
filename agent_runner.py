@@ -257,9 +257,22 @@ def _is_action_required(text: str) -> bool:
     if not text:
         return False
     low = text.lower()
-    if _looks_like_question(text):
+    ask_markers = [
+        "需要你",
+        "请回复我",
+        "请告诉我",
+        "请选择",
+        "你希望",
+        "你要",
+        "do you want",
+        "would you like",
+        "please tell me",
+    ]
+    if any(marker in low for marker in ask_markers):
         return True
-    return any(word in low for word in RISK_KEYWORDS)
+    if any(word in low for word in RISK_KEYWORDS):
+        return True
+    return False
 
 
 def _summarize_event(event: dict) -> str:
