@@ -438,6 +438,8 @@ def _format_global_sessions(limit: int = 8) -> list[str]:
 def _format_waiting_message(session_id: str, item: dict) -> str:
     cwd = _project_label(item.get("cwd", ""))
     reason = str(item.get("waiting_reason") or item.get("last_text") or "Claude 正在等待你的输入").strip()
+    if reason.lower() == "claude is waiting for your input":
+        reason = "Claude 正在等待你的输入，但这次还没从 transcript 里提取到更具体的问题内容。"
     return (
         f"⚠️ Claude 会话需要你操作\n"
         f"会话：{session_id[:8]}\n"

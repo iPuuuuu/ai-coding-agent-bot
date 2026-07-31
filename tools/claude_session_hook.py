@@ -69,7 +69,7 @@ def _event_name(data: dict[str, Any]) -> str:
 
 def _extract_text(data: dict[str, Any]) -> str:
     parts: list[str] = []
-    for key in ("prompt", "stopReason", "reason", "systemMessage"):
+    for key in ("message", "prompt", "stopReason", "reason", "systemMessage"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
             parts.append(value.strip())
@@ -91,7 +91,9 @@ def _extract_text(data: dict[str, Any]) -> str:
 def _looks_waiting(event_name: str, text: str) -> bool:
     low_event = event_name.lower()
     low_text = text.lower()
-    if "notification" in low_event:
+    if "notification" in low_event and text.strip() and "waiting for your input" not in low_text:
+        return True
+    if "waiting for your input" in low_text:
         return True
     if "?" in text or "？" in text:
         return True
@@ -117,7 +119,7 @@ def _extract_transcript_text(payload: dict[str, Any]) -> str:
         return ""
     try:
         with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()[-80:]
+            lines = fh.readlines()[-120:]
     except Exception:
         return ""
     for raw in reversed(lines):
@@ -125,7 +127,8 @@ def _extract_transcript_text(payload: dict[str, Any]) -> str:
             item = json.loads(raw)
         except Exception:
             continue
-        if item.get("type") == "assistant":
+        item_type = item.get("type")
+        if item_type == "assistant":
             message = item.get("message", {})
             content = message.get("content", [])
             parts = []
@@ -136,10 +139,24 @@ def _extract_transcript_text(payload: dict[str, Any]) -> str:
                         parts.append(text)
             if parts:
                 return "\n\n".join(parts).strip()[:2000]
-        if item.get("type") == "result":
+        if item_type == "result":
             result = (item.get("result") or "").strip()
             if result:
                 return result[:2000]
+        message = item.get("message") or {}
+        if isinstance(message, dict):
+            content = message.get("content") or []
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = (block.get("text") or "").strip()
+                        if text:
+                            text_parts.append(text)
+                if text_parts:
+                    merged = "\n\n".join(text_parts).strip()
+                    if merged:
+                        return merged[:2000]
     return ""
 
 
