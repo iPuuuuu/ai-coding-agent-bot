@@ -1,13 +1,10 @@
 """
 agent_runner.py —— 封装一次 Claude Code CLI 对话回合。
 
-每收到你的一条指令就调用 run_turn()：
-- 启动本机 claude CLI 子进程
-- 流式读取 stream-json 输出
-- 把文本/状态/结果转发到 Telegram
-- 支持停止当前任务
-
-这条路线不再依赖 claude-agent-sdk，避免 pip 依赖链阻塞。
+bot 端现在显式托管 Claude session：
+- 只有明确创建时才新开 Claude 会话
+- 后续继续对话时，始终 resume 到指定 session
+- 不再依赖“按 cwd 猜最近会话”的隐式行为
 """
 from __future__ import annotations
 
@@ -40,7 +37,6 @@ SYSTEM_PROMPT = """你是一个常驻在用户家里 Windows 电脑上的编程�
 """
 
 _stop_requested = False
-_last_session_id_by_cwd: dict[str, str] = {}
 _active_process: Optional[asyncio.subprocess.Process] = None
 
 
@@ -79,12 +75,12 @@ def _reset_stop_flag():
     _stop_requested = False
 
 
-async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> TurnOutcome:
-    """跑一回合，把过程镜像发到 Telegram。"""
+async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> TurnOutcome:
+    """跑一回合；session_id 为空时新建会话，否则继续指定会话。"""
     await _ensure_claude_available()
     _reset_stop_flag()
 
-    outcome = TurnOutcome()
+    outcome = TurnOutcome(session_id=session_id or "")
     system_prompt = SYSTEM_PROMPT.format(rules=build_supervisor_rules_text())
     command = _claude_command()
 
@@ -103,8 +99,7 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> TurnOutc
         prompt,
     ]
 
-    session_id = _last_session_id_by_cwd.get(cwd)
-    if is_followup and session_id:
+    if session_id:
         cmd[1:1] = ["--resume", session_id]
 
     global _active_process
@@ -136,9 +131,6 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> TurnOutc
             raise asyncio.CancelledError()
         if rc != 0:
             raise AgentRunnerError(outcome.final_text or f"Claude CLI 退出码 {rc}")
-
-        if outcome.session_id:
-            _last_session_id_by_cwd[cwd] = outcome.session_id
 
         await _maybe_send_visual_help(prompt, cwd)
         return outcome
@@ -173,7 +165,7 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
 
     event_type = event.get("type")
     if event_type == "system" and event.get("subtype") == "init":
-        outcome.session_id = event.get("session_id", "")
+        outcome.session_id = event.get("session_id", outcome.session_id)
         outcome.events.append(MirrorEvent(kind="system/init", text=f"session={outcome.session_id}", session_id=outcome.session_id))
         await channel.send_status(f"会话已建立：{outcome.session_id[:8]}")
         return False
