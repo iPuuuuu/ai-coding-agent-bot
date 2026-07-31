@@ -435,6 +435,17 @@ def _format_global_sessions(limit: int = 8) -> list[str]:
     return lines
 
 
+def _format_waiting_message(session_id: str, item: dict) -> str:
+    cwd = _project_label(item.get("cwd", ""))
+    reason = str(item.get("waiting_reason") or item.get("last_text") or "Claude 正在等待你的输入").strip()
+    return (
+        f"⚠️ Claude 会话需要你操作\n"
+        f"会话：{session_id[:8]}\n"
+        f"项目：{cwd}\n\n"
+        f"{reason[:1200]}"
+    )
+
+
 def _adopt_global_session(session_id: str) -> ManagedSession | None:
     sessions = _load_global_sessions()
     item = sessions.get(session_id)
@@ -453,8 +464,8 @@ def _adopt_global_session(session_id: str) -> ManagedSession | None:
             project_label=_project_label(cwd),
             session_id=session_id,
             prompt_text=str(item.get("waiting_reason") or item.get("last_text") or "Claude 正在等待你的回复"),
-            options=[],
-            source="text",
+            options=list(item.get("choice_options") or []),
+            source="buttons" if item.get("choice_options") else "text",
         )
     return session
 
@@ -507,19 +518,33 @@ async def _poll_global_sessions(context: ContextTypes.DEFAULT_TYPE):
         item = sessions.get(session_id, {})
         if not item.get("waiting"):
             continue
-        reason = str(item.get("waiting_reason", "") or event.get("text", "")).strip()
+        reason = str(item.get("waiting_reason", "") or item.get("last_text", "")).strip()
         if not reason:
             continue
         if _last_waiting_notice.get(session_id) == reason:
             continue
         _last_waiting_notice[session_id] = reason
-        cwd = _project_label(item.get("cwd", ""))
-        await channel.send_text(
-            f"⚠️ Claude 会话需要你操作\n"
-            f"会话：{session_id[:8]}\n"
-            f"项目：{cwd}\n"
-            f"原因：{reason[:800]}"
-        )
+        message = _format_waiting_message(session_id, item)
+        options = item.get("choice_options") or []
+        if options:
+            choice = await channel.ask_choice(message, options, timeout=config.APPROVAL_TIMEOUT)
+            if choice is not None:
+                adopted = _adopt_global_session(session_id)
+                if adopted is not None:
+                    _state.pending = PendingInteraction(
+                        project_path=adopted.project_path,
+                        project_label=adopted.project_label,
+                        session_id=session_id,
+                        prompt_text=reason,
+                        options=options,
+                        source="buttons",
+                    )
+                    _state.set_current_project(adopted.project_path)
+                    _state.current_session_id = session_id
+                    _state.mark_running(f"收到你的选择：{choice}", adopted.project_path, session_id)
+                    asyncio.create_task(_run_agent(choice, adopted.project_path, session_id))
+        else:
+            await channel.send_text(message)
 
 
 async def _run_agent(prompt: str, project_path: str, session_id: str):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -97,6 +98,51 @@ def _looks_waiting(event_name: str, text: str) -> bool:
     return any(marker in low_text for marker in QUESTION_MARKERS)
 
 
+def _parse_options(text: str) -> list[str]:
+    options: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^(\d+[\).]|[A-Da-d][\).]|[-*•])\s+", line):
+            cleaned = re.sub(r"^(\d+[\).]|[A-Da-d][\).]|[-*•])\s+", "", line).strip()
+            if cleaned and cleaned not in options:
+                options.append(cleaned[:80])
+    return options[:4] if 2 <= len(options) <= 4 else []
+
+
+def _extract_transcript_text(payload: dict[str, Any]) -> str:
+    transcript_path = payload.get("transcript_path")
+    if not transcript_path or not os.path.exists(transcript_path):
+        return ""
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()[-80:]
+    except Exception:
+        return ""
+    for raw in reversed(lines):
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+        if item.get("type") == "assistant":
+            message = item.get("message", {})
+            content = message.get("content", [])
+            parts = []
+            for block in content:
+                if block.get("type") == "text":
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+            if parts:
+                return "\n\n".join(parts).strip()[:2000]
+        if item.get("type") == "result":
+            result = (item.get("result") or "").strip()
+            if result:
+                return result[:2000]
+    return ""
+
+
 def _load_snapshot() -> dict[str, Any]:
     if not SNAPSHOT_FILE.exists():
         return {"sessions": {}}
@@ -131,6 +177,9 @@ def main():
     cwd = _cwd(payload)
     event_name = _event_name(payload)
     text = _extract_text(payload)
+    transcript_text = _extract_transcript_text(payload)
+    if transcript_text:
+        text = transcript_text
 
     entry = {
         "timestamp": ts,
@@ -162,6 +211,7 @@ def main():
     session["updated_at"] = ts
     session["last_event"] = event_name
     session["last_text"] = text
+    session["choice_options"] = _parse_options(text)
     session["waiting"] = _looks_waiting(event_name, text)
     if session["waiting"]:
         session["waiting_reason"] = text[:300]
