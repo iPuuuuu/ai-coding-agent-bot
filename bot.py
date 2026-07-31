@@ -396,6 +396,9 @@ def _resolve_session_id(prefix: str) -> str:
     for session_id in _state.sessions:
         if session_id.startswith(prefix):
             return session_id
+    for session_id in _load_global_sessions():
+        if str(session_id).startswith(prefix):
+            return str(session_id)
     return ""
 
 
@@ -426,9 +429,34 @@ def _format_global_sessions(limit: int = 8) -> list[str]:
         cwd = _project_label(item.get("cwd", ""))
         session_id = str(item.get("session_id", ""))[:8] or "-"
         status = item.get("status", "unknown")
+        waiting = " | waiting" if item.get("waiting") else ""
         last_event = str(item.get("last_event", ""))[:28]
-        lines.append(f"• {session_id} | {cwd} | {status} | {last_event}")
+        lines.append(f"• {session_id} | {cwd} | {status}{waiting} | {last_event}")
     return lines
+
+
+def _adopt_global_session(session_id: str) -> ManagedSession | None:
+    sessions = _load_global_sessions()
+    item = sessions.get(session_id)
+    if not item:
+        return None
+    cwd = _norm_path(item.get("cwd", config.DEFAULT_PROJECT_DIR) or config.DEFAULT_PROJECT_DIR)
+    _state.ensure_project(cwd)
+    session = _state.bind_session(session_id, cwd)
+    session.title = str(item.get("last_text") or item.get("last_event") or session.title)[:48] or session.title
+    session.mode = "waiting_user_reply" if item.get("waiting") else item.get("status", "active")
+    session.last_event = str(item.get("last_event", session.last_event))
+    session.updated_at = float(item.get("updated_at", time.time()) or time.time())
+    if item.get("waiting"):
+        _state.pending = PendingInteraction(
+            project_path=cwd,
+            project_label=_project_label(cwd),
+            session_id=session_id,
+            prompt_text=str(item.get("waiting_reason") or item.get("last_text") or "Claude 正在等待你的回复"),
+            options=[],
+            source="text",
+        )
+    return session
 
 
 _state = RuntimeState()
@@ -643,7 +671,12 @@ async def cmd_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not session_id:
         await update.message.reply_text("没找到这个会话。先用 /sessions 看可用会话。")
         return
-    session = _state.sessions[session_id]
+    session = _state.sessions.get(session_id)
+    if session is None:
+        session = _adopt_global_session(session_id)
+    if session is None:
+        await update.message.reply_text("这个会话目前只能看到摘要，暂时还不能接管。")
+        return
     _state.set_current_project(session.project_path)
     _state.current_session_id = session_id
     _state.start_new_session_next = False
@@ -752,6 +785,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             target_path = _state.current_cwd
             force_new = _state.start_new_session_next
             session_id = _state.choose_session_for_prompt(force_new)
+            if session_id and session_id not in _state.sessions:
+                adopted = _adopt_global_session(session_id)
+                if adopted is not None:
+                    target_path = adopted.project_path
+                    _state.current_cwd = adopted.project_path
+                    _state.current_project_label = adopted.project_label
             _state.start_task(prompt, target_path, session_id, force_new)
             action = "新会话" if force_new or not session_id else f"继续会话 {session_id[:8]}"
             await update.message.reply_text(
