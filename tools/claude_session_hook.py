@@ -14,6 +14,18 @@ SNAPSHOT_FILE = MONITOR_DIR / "sessions.json"
 MAX_EVENTS = 200
 
 
+QUESTION_MARKERS = [
+    "请选择",
+    "请确认",
+    "需要你",
+    "告诉我",
+    "would you like",
+    "do you want",
+    "please choose",
+    "please confirm",
+]
+
+
 def _safe_load_stdin() -> dict[str, Any]:
     raw = sys.stdin.read().strip()
     if not raw:
@@ -73,6 +85,16 @@ def _extract_text(data: dict[str, Any]) -> str:
         except Exception:
             parts.append(str(data)[:500])
     return " | ".join(parts)[:1000]
+
+
+def _looks_waiting(event_name: str, text: str) -> bool:
+    low_event = event_name.lower()
+    low_text = text.lower()
+    if "notification" in low_event:
+        return True
+    if "?" in text or "？" in text:
+        return True
+    return any(marker in low_text for marker in QUESTION_MARKERS)
 
 
 def _load_snapshot() -> dict[str, Any]:
@@ -140,6 +162,11 @@ def main():
     session["updated_at"] = ts
     session["last_event"] = event_name
     session["last_text"] = text
+    session["waiting"] = _looks_waiting(event_name, text)
+    if session["waiting"]:
+        session["waiting_reason"] = text[:300]
+    elif event_name.lower().startswith("stop"):
+        session["waiting_reason"] = ""
     if event_name.lower().startswith("stop"):
         session["status"] = "stopped"
         session["stopped_at"] = ts

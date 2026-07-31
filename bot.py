@@ -437,6 +437,8 @@ for _path in config.DEFAULT_PROJECTS:
 _state.set_current_project(config.DEFAULT_PROJECT_DIR)
 _task_lock = asyncio.Lock()
 _current_task: Optional[asyncio.Task] = None
+_seen_global_event_offset = 0
+_last_waiting_notice: dict[str, str] = {}
 
 
 def _authorized(update: Update) -> bool:
@@ -448,6 +450,48 @@ async def _send_unauthorized(update: Update):
         await update.message.reply_text("⛔ 未授权。")
     elif update.callback_query:
         await update.callback_query.answer("⛔ 未授权", show_alert=True)
+
+
+async def _poll_global_sessions(context: ContextTypes.DEFAULT_TYPE):
+    global _seen_global_event_offset
+    path = config.SESSION_EVENT_LOG
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            fh.seek(_seen_global_event_offset)
+            new_lines = fh.readlines()
+            _seen_global_event_offset = fh.tell()
+    except Exception:
+        return
+    if not new_lines:
+        return
+
+    sessions = _load_global_sessions()
+    for raw in new_lines[-20:]:
+        try:
+            event = json.loads(raw)
+        except Exception:
+            continue
+        session_id = str(event.get("session_id", ""))
+        if not session_id:
+            continue
+        item = sessions.get(session_id, {})
+        if not item.get("waiting"):
+            continue
+        reason = str(item.get("waiting_reason", "") or event.get("text", "")).strip()
+        if not reason:
+            continue
+        if _last_waiting_notice.get(session_id) == reason:
+            continue
+        _last_waiting_notice[session_id] = reason
+        cwd = _project_label(item.get("cwd", ""))
+        await channel.send_text(
+            f"⚠️ Claude 会话需要你操作\n"
+            f"会话：{session_id[:8]}\n"
+            f"项目：{cwd}\n"
+            f"原因：{reason[:800]}"
+        )
 
 
 async def _run_agent(prompt: str, project_path: str, session_id: str):
@@ -720,6 +764,19 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _current_task = asyncio.create_task(_run_agent(prompt, target_path, session_id))
 
 
+async def _background_poll_loop(app: Application):
+    while True:
+        try:
+            await _poll_global_sessions(None)
+        except Exception:
+            log.exception("global session poll failed")
+        await asyncio.sleep(3)
+
+
+async def _post_init(app: Application):
+    asyncio.create_task(_background_poll_loop(app))
+
+
 # ---------------- 启动 ----------------
 
 def main():
@@ -730,7 +787,7 @@ def main():
     for path in config.DEFAULT_PROJECTS:
         os.makedirs(path, exist_ok=True)
 
-    app = Application.builder().token(config.TELEGRAM_TOKEN).build()
+    app = Application.builder().token(config.TELEGRAM_TOKEN).post_init(_post_init).build()
 
     channel.init(app.bot, config.ALLOWED_CHAT_ID)
 
