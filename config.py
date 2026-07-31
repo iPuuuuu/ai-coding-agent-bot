@@ -8,6 +8,16 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "0"))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", os.getcwd())
+DEFAULT_PROJECTS = [
+    path.strip()
+    for path in os.getenv(
+        "MONITORED_PROJECTS",
+        "C:/Users/wmh/Desktop/bot,C:/Users/wmh/Desktop/doctor-wang",
+    ).split(",")
+    if path.strip()
+]
+if DEFAULT_PROJECT_DIR not in DEFAULT_PROJECTS:
+    DEFAULT_PROJECTS.insert(0, DEFAULT_PROJECT_DIR)
 APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT", "300"))
 APPROVAL_TIMEOUT_ACTION = os.getenv("APPROVAL_TIMEOUT_ACTION", "deny").lower()
 

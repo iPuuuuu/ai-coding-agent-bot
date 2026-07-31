@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import channel
+import config
 from permissions import build_supervisor_rules_text
 from tools.run_project import detect_run_hint
 from tools.screenshot import maybe_handle_visual_request
@@ -28,9 +29,10 @@ SYSTEM_PROMPT = """你是一个常驻在用户家里 Windows 电脑上的编程�
 1. 你运行在 Claude Code CLI 中，可以读写代码、运行命令、修改项目。
 2. 用户只有手机 Telegram，所以你要主动汇报当前进度、下一步和阻塞点。
 3. 如果任务涉及高风险操作（例如安装依赖、联网下载、删除文件、git push），不要直接执行；先明确向用户提问，等待用户回复后再继续。
-4. 回答保持精炼，适合手机阅读。
-5. 如果你需要用户补充信息，请明确提出问题，并以问句结尾。
-6. 如果你判断项目适合运行后截图，请在结论里明确说出建议的启动命令或可访问地址。
+4. 回答保持精炼，适合手机阅读：先给一句结论，再给最多 4 个短要点。
+5. 不要重复上下文；除非有新信息，不要把同一结论说两遍。
+6. 如果你需要用户补充信息，请明确提出问题，并以“需要你决定/请回复我”结尾。
+7. 如果你判断项目适合运行后截图，请在结论里明确说出建议的启动命令或可访问地址。
 
 风险规则：
 {rules}
@@ -39,6 +41,9 @@ SYSTEM_PROMPT = """你是一个常驻在用户家里 Windows 电脑上的编程�
 _stop_requested = False
 _last_session_id_by_cwd: dict[str, str] = {}
 _active_process: Optional[asyncio.subprocess.Process] = None
+
+
+RISK_KEYWORDS = tuple(k.lower() for k in config.YELLOW_KEYWORDS)
 
 
 def _claude_command() -> str:
@@ -67,6 +72,9 @@ class TurnOutcome:
     state: str = "completed"
     final_text: str = ""
     session_id: str = ""
+    action_required: bool = False
+    action_text: str = ""
+    progress_sent: bool = False
 
 
 class AgentRunnerError(RuntimeError):
@@ -142,7 +150,7 @@ async def run_turn(prompt: str, cwd: str, is_followup: bool = False) -> str:
         if _stop_requested:
             raise asyncio.CancelledError()
         if rc != 0:
-            raise AgentRunnerError(f"Claude CLI 退出码 {rc}")
+            raise AgentRunnerError(outcome.final_text or f"Claude CLI 退出码 {rc}")
 
         if outcome.session_id:
             _last_session_id_by_cwd[cwd] = outcome.session_id
@@ -175,8 +183,7 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
-        await channel.send_text(line)
-        return _looks_like_question(line)
+        return False
 
     event_type = event.get("type")
     if event_type == "system" and event.get("subtype") == "init":
@@ -184,31 +191,32 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
         return False
 
     if event_type == "assistant":
-        message = event.get("message", {})
-        for block in message.get("content", []):
-            if block.get("type") == "text":
-                text = (block.get("text") or "").strip()
-                if text:
-                    outcome.final_text = text
-                    await channel.send_text(text)
-                    if _looks_like_question(text):
-                        waiting = True
+        text = _extract_text(event.get("message", {}))
+        if not text:
+            return False
+        waiting = _is_action_required(text)
+        if waiting:
+            outcome.action_required = True
+            outcome.action_text = text
+            outcome.final_text = text
+            await channel.send_text(f"需要你操作：{_compact_text(text, 280)}")
+        elif not outcome.progress_sent:
+            outcome.progress_sent = True
+            await channel.send_status("处理中…")
         return waiting
 
     if event_type == "result":
         outcome.session_id = event.get("session_id", outcome.session_id)
-        result = (event.get("result") or "").strip()
-        if result and result != outcome.final_text:
+        result = _compact_text((event.get("result") or "").strip(), 700)
+        if result:
             outcome.final_text = result
-            await channel.send_text(result)
         if event.get("subtype") == "success":
-            await channel.send_text("✅ 本轮处理结束")
-        else:
-            raise AgentRunnerError(result or "Claude CLI 执行失败")
-        return _looks_like_question(result)
-
-    if event_type == "user":
-        return False
+            if outcome.action_required:
+                return True
+            if result:
+                await channel.send_text(result)
+            return _is_action_required(result)
+        raise AgentRunnerError(result or "Claude CLI 执行失败")
 
     summary = _summarize_event(event)
     if summary:
@@ -222,21 +230,50 @@ async def _maybe_send_visual_help(prompt: str, cwd: str):
     hint = detect_run_hint(cwd)
     if hint:
         await channel.send_text(
-            f"💡 我检测到这个项目可能可以这样运行：`{hint.command}`"
-            + (f"\n可能地址：{hint.url_hint}" if hint.url_hint else "")
-            + (f"\n依据：{hint.reason}" if hint.reason else "")
+            f"可尝试运行：`{hint.command}`"
+            + (f"\n地址：{hint.url_hint}" if hint.url_hint else "")
         )
     await maybe_handle_visual_request(prompt)
+
+
+def _extract_text(message: dict) -> str:
+    parts = []
+    for block in message.get("content", []):
+        if block.get("type") == "text":
+            text = (block.get("text") or "").strip()
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts).strip()
+
+
+def _compact_text(text: str, limit: int) -> str:
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _is_action_required(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    if _looks_like_question(text):
+        return True
+    return any(word in low for word in RISK_KEYWORDS)
 
 
 def _summarize_event(event: dict) -> str:
     event_type = event.get("type")
     if event_type == "system":
         subtype = event.get("subtype")
-        if subtype and subtype != "init":
-            return f"ℹ️ {subtype}"
-    if event_type and event_type not in {"assistant", "result", "user"}:
-        return f"🔧 事件：{event_type}"
+        if subtype in {"thinking", "thinking_tokens", "init"}:
+            return ""
+        if subtype:
+            return f"状态：{subtype}"
+    if event_type in {"assistant", "result", "user"}:
+        return ""
+    if event_type:
+        return f"状态：{event_type}"
     return ""
 
 
@@ -254,5 +291,7 @@ def _looks_like_question(text: str) -> bool:
         "please tell me",
         "需要你",
         "告诉我",
+        "请回复我",
+        "需要你决定",
     ]
     return question_mark or any(word in low for word in ask_words)

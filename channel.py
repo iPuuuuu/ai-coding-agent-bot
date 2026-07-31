@@ -31,8 +31,11 @@ async def send_text(text: str):
     """发文字。Telegram 单条上限 4096 字符，自动分段。"""
     if not _bot or not text:
         return
-    for i in range(0, len(text), 3800):
-        chunk = text[i:i + 3800]
+    text = text.strip()
+    if len(text) > 1200:
+        text = text[:1200].rstrip() + "\n..."
+    for i in range(0, len(text), 1200):
+        chunk = text[i:i + 1200]
         try:
             await _bot.send_message(chat_id=_chat_id, text=chunk)
         except Exception:
