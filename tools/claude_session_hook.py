@@ -26,6 +26,12 @@ QUESTION_MARKERS = [
     "please confirm",
 ]
 
+IGNORED_NOTIFICATION_TYPES = {"idle_prompt"}
+GENERIC_WAIT_MESSAGES = {
+    "claude is waiting for your input",
+    "waiting for your input",
+}
+
 
 def _safe_load_stdin() -> dict[str, Any]:
     raw = sys.stdin.read().strip()
@@ -59,6 +65,15 @@ def _cwd(data: dict[str, Any]) -> str:
     return _norm_path(os.getcwd())
 
 
+def _transcript_path(data: dict[str, Any]) -> str:
+    value = data.get("transcript_path") or data.get("transcriptPath") or ""
+    return str(value)
+
+
+def _notification_type(data: dict[str, Any]) -> str:
+    return str(data.get("notification_type") or data.get("notificationType") or "")
+
+
 def _event_name(data: dict[str, Any]) -> str:
     name = str(data.get("hook_event_name") or data.get("hookEventName") or data.get("event") or "unknown")
     tool = str(data.get("tool_name") or data.get("toolName") or "")
@@ -88,12 +103,28 @@ def _extract_text(data: dict[str, Any]) -> str:
     return " | ".join(parts)[:1000]
 
 
-def _looks_waiting(event_name: str, text: str) -> bool:
+def _clean_text(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    if text.startswith("{") and '"session_id"' in text and '"message"' in text:
+        return ""
+    if text.lower() in GENERIC_WAIT_MESSAGES:
+        return ""
+    return text[:2000]
+
+
+def _looks_waiting(event_name: str, notification_type: str, text: str) -> bool:
     low_event = event_name.lower()
+    low_notification = notification_type.lower()
     low_text = text.lower()
-    if "notification" in low_event and text.strip() and "waiting for your input" not in low_text:
+    if low_notification in IGNORED_NOTIFICATION_TYPES:
+        return False
+    if low_notification == "permission_prompt":
         return True
-    if "waiting for your input" in low_text:
+    if "notification" in low_event and text.strip() and low_text not in GENERIC_WAIT_MESSAGES:
+        return True
+    if low_text in GENERIC_WAIT_MESSAGES:
         return True
     if "?" in text or "？" in text:
         return True
@@ -108,56 +139,61 @@ def _parse_options(text: str) -> list[str]:
             continue
         if re.match(r"^(\d+[\).]|[A-Da-d][\).]|[-*•])\s+", line):
             cleaned = re.sub(r"^(\d+[\).]|[A-Da-d][\).]|[-*•])\s+", "", line).strip()
-            if cleaned and cleaned not in options:
-                options.append(cleaned[:80])
+            if cleaned and len(cleaned) <= 80 and cleaned not in options:
+                options.append(cleaned)
     return options[:4] if 2 <= len(options) <= 4 else []
 
 
-def _extract_transcript_text(payload: dict[str, Any]) -> str:
-    transcript_path = payload.get("transcript_path")
+def _extract_transcript_text(transcript_path: str) -> str:
     if not transcript_path or not os.path.exists(transcript_path):
         return ""
     try:
         with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()[-120:]
+            lines = fh.readlines()[-160:]
     except Exception:
         return ""
+
+    candidates: list[str] = []
     for raw in reversed(lines):
         try:
             item = json.loads(raw)
         except Exception:
             continue
+
         item_type = item.get("type")
+        text_parts: list[str] = []
+
         if item_type == "assistant":
             message = item.get("message", {})
             content = message.get("content", [])
-            parts = []
             for block in content:
-                if block.get("type") == "text":
+                if isinstance(block, dict) and block.get("type") == "text":
                     text = (block.get("text") or "").strip()
                     if text:
-                        parts.append(text)
-            if parts:
-                return "\n\n".join(parts).strip()[:2000]
-        if item_type == "result":
+                        text_parts.append(text)
+        elif item_type == "result":
             result = (item.get("result") or "").strip()
             if result:
-                return result[:2000]
-        message = item.get("message") or {}
-        if isinstance(message, dict):
-            content = message.get("content") or []
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = (block.get("text") or "").strip()
-                        if text:
-                            text_parts.append(text)
-                if text_parts:
-                    merged = "\n\n".join(text_parts).strip()
-                    if merged:
-                        return merged[:2000]
-    return ""
+                text_parts.append(result)
+        else:
+            message = item.get("message") or {}
+            if isinstance(message, dict):
+                content = message.get("content") or []
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = (block.get("text") or "").strip()
+                            if text:
+                                text_parts.append(text)
+
+        merged = _clean_text("\n\n".join(text_parts).strip())
+        if not merged:
+            continue
+        if _parse_options(merged) or "?" in merged or "？" in merged or any(marker in merged.lower() for marker in QUESTION_MARKERS):
+            return merged
+        candidates.append(merged)
+
+    return candidates[0][:2000] if candidates else ""
 
 
 def _load_snapshot() -> dict[str, Any]:
@@ -192,11 +228,19 @@ def main():
     ts = _now()
     session_id = _session_id(payload)
     cwd = _cwd(payload)
+    transcript_path = _transcript_path(payload)
+    notification_type = _notification_type(payload)
     event_name = _event_name(payload)
-    text = _extract_text(payload)
-    transcript_text = _extract_transcript_text(payload)
+    text = _clean_text(_extract_text(payload))
+    transcript_text = _extract_transcript_text(transcript_path)
     if transcript_text:
         text = transcript_text
+
+    waiting = _looks_waiting(event_name, notification_type, text)
+    choice_options = _parse_options(text) if waiting else []
+    if notification_type == "permission_prompt" and not text:
+        text = "Claude 正在等待权限确认，请在电脑端或 Telegram 上继续操作。"
+        waiting = True
 
     entry = {
         "timestamp": ts,
@@ -204,6 +248,8 @@ def main():
         "cwd": cwd,
         "event": event_name,
         "text": text,
+        "notification_type": notification_type,
+        "transcript_path": transcript_path,
     }
     _append_event(entry)
 
@@ -228,10 +274,12 @@ def main():
     session["updated_at"] = ts
     session["last_event"] = event_name
     session["last_text"] = text
-    session["choice_options"] = _parse_options(text)
-    session["waiting"] = _looks_waiting(event_name, text)
+    session["notification_type"] = notification_type
+    session["transcript_path"] = transcript_path
+    session["choice_options"] = choice_options
+    session["waiting"] = waiting
     if session["waiting"]:
-        session["waiting_reason"] = text[:300]
+        session["waiting_reason"] = text[:300] if text else "Claude 正在等待你的输入"
     elif event_name.lower().startswith("stop"):
         session["waiting_reason"] = ""
     if event_name.lower().startswith("stop"):
