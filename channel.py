@@ -13,6 +13,7 @@ import uuid
 
 _bot = None            # telegram.Bot 实例
 _chat_id = None        # 你的 chat_id（只给你发）
+_feishu = None         # FeishuTransport 实例（避免 channel 依赖飞书 SDK）
 
 _pending: dict[str, dict] = {}
 _last_status_text = ""
@@ -20,18 +21,32 @@ _last_status_at = 0.0
 
 
 def init(bot, chat_id: int):
-    global _bot, _chat_id
+    global _bot, _chat_id, _feishu
     _bot = bot
     _chat_id = chat_id
+    _feishu = None
+
+
+def init_feishu(transport):
+    """Inject the Feishu implementation of the outbound channel."""
+    global _bot, _chat_id, _feishu
+    _bot = None
+    _chat_id = None
+    _feishu = transport
 
 
 # ---------------- 基础发送 ----------------
 
 async def send_text(text: str):
     """发文字。Telegram 单条上限 4096 字符，自动分段。"""
-    if not _bot or not text:
+    if not text:
         return
     text = text.strip()
+    if _feishu is not None:
+        await _feishu.send_text(text)
+        return
+    if not _bot:
+        return
     for i in range(0, len(text), 3500):
         chunk = text[i:i + 3500]
         try:
@@ -53,6 +68,9 @@ async def send_status(text: str, min_interval: float = 1.5):
 
 async def send_photo(path: str, caption: str = ""):
     """把一张图片（截图）发给你。"""
+    if _feishu is not None:
+        await _feishu.send_photo(path, caption)
+        return
     if not _bot:
         return
     try:
@@ -66,9 +84,7 @@ async def send_photo(path: str, caption: str = ""):
 
 async def ask_choice(text: str, options: list[str], timeout: int) -> str | None:
     """发多选按钮，等待用户点选；超时返回 None。"""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    if not _bot or not options:
+    if (not _bot and _feishu is None) or not options:
         return None
 
     choice_id = uuid.uuid4().hex[:8]
@@ -76,10 +92,14 @@ async def ask_choice(text: str, options: list[str], timeout: int) -> str | None:
     fut: asyncio.Future = loop.create_future()
     _pending[choice_id] = {"future": fut, "options": options}
 
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(label[:32], callback_data=f"pick:{choice_id}:{idx}")] for idx, label in enumerate(options)]
-    )
-    await _bot.send_message(chat_id=_chat_id, text=text, reply_markup=keyboard)
+    if _feishu is not None:
+        await _feishu.send_choice(text, options, choice_id)
+    else:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(label[:32], callback_data=f"pick:{choice_id}:{idx}")] for idx, label in enumerate(options)]
+        )
+        await _bot.send_message(chat_id=_chat_id, text=text, reply_markup=keyboard)
 
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
@@ -119,3 +139,57 @@ def resolve_approval(callback_data: str) -> str | None:
     choice = options[index]
     fut.set_result(choice)
     return choice
+
+
+async def send_monitor_choices(text: str, choices: list[tuple[str, str]]):
+    """Send non-blocking session-detail buttons.
+
+    Unlike ``ask_choice``, these buttons do not create a pending approval or
+    wait for a result: their callback only opens a monitor detail view.
+    """
+    if not choices or (not _bot and _feishu is None):
+        return
+    if _feishu is not None:
+        await _feishu.send_monitor_choices(text, choices)
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label[:48], callback_data=data)] for label, data in choices]
+    )
+    await _bot.send_message(chat_id=_chat_id, text=text[:3500], reply_markup=keyboard)
+
+
+async def send_command_menu():
+    """Send a non-blocking dashboard of common bot actions."""
+    choices = [
+        ("📊 当前状态", "dashboard:status"),
+        ("🖥️ 会话监控", "dashboard:monitor"),
+        ("💬 托管会话", "dashboard:sessions"),
+        ("📁 切换项目", "dashboard:project"),
+        ("➕ 新建会话", "dashboard:new"),
+        ("⏹️ 停止任务", "dashboard:stop"),
+    ]
+    if not _bot and _feishu is None:
+        return
+    if _feishu is not None:
+        await _feishu.send_command_menu(choices)
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=data) for label, data in choices[index:index + 2]]
+        for index in range(0, len(choices), 2)
+    ])
+    await _bot.send_message(chat_id=_chat_id, text="快捷操作：", reply_markup=keyboard)
+
+
+async def send_project_choices(choices: list[tuple[str, str]]):
+    if not choices or (not _bot and _feishu is None):
+        return
+    if _feishu is not None:
+        await _feishu.send_project_choices(choices)
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label[:48], callback_data=data)] for label, data in choices]
+    )
+    await _bot.send_message(chat_id=_chat_id, text="请选择要切换的项目：", reply_markup=keyboard)

@@ -1,5 +1,6 @@
 # Python-side dependencies for the Telegram bridge and helpers
 python-telegram-bot>=21.0
+lark-oapi>=1.4.0
 python-dotenv>=1.0.0
 mss>=9.0.0
 playwright>=1.40.0

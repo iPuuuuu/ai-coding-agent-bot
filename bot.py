@@ -30,6 +30,7 @@ from telegram.ext import (
 import agent_runner
 import channel
 import config
+from tools.codex_session_monitor import scan_sessions as scan_codex_sessions
 
 logging.basicConfig(
     level=logging.INFO,
@@ -435,6 +436,156 @@ def _format_global_sessions(limit: int = 8) -> list[str]:
     return lines
 
 
+def _load_codex_sessions() -> dict[str, dict]:
+    """Read local Codex rollout metadata without exposing rollout contents."""
+    try:
+        return scan_codex_sessions(config.CODEX_SESSIONS_DIR)
+    except Exception:
+        log.exception("codex session scan failed")
+        return {}
+
+
+def _session_status_label(status: str) -> str:
+    labels = {
+        "running": "运行中", "active": "活动中", "waiting": "等待输入",
+        "waiting_user_reply": "等待回复", "completed": "已完成",
+        "stopped": "已停止", "stale": "疑似中断", "unknown": "未知",
+    }
+    return labels.get(status, status or "未知")
+
+
+def _format_all_sessions(limit: int = 20) -> str:
+    """Unified, privacy-preserving overview of Claude and Codex sessions."""
+    rows: list[tuple[float, str, str]] = []
+    for item in _load_global_sessions().values():
+        session_id = str(item.get("session_id", ""))
+        status = "waiting" if item.get("waiting") else str(item.get("status", "unknown"))
+        project = _project_label(str(item.get("cwd", "")))
+        event = str(item.get("last_event", ""))[:42]
+        rows.append((float(item.get("updated_at", 0) or 0), status, f"[Claude] {session_id[:8] or '-'} | {_session_status_label(status)} | {project} | {event}"))
+    for item in _load_codex_sessions().values():
+        session_id = str(item.get("session_id", ""))
+        status = str(item.get("status", "unknown"))
+        project = _project_label(str(item.get("cwd", ""))) if item.get("cwd") else "-"
+        event = str(item.get("last_event", ""))[:42]
+        rows.append((float(item.get("updated_at", 0) or 0), status, f"[Codex] {session_id[:8] or '-'} | {_session_status_label(status)} | {project} | {event}"))
+    if not rows:
+        return "暂无本机 Claude 或 Codex 会话记录。"
+    rows.sort(key=lambda item: item[0], reverse=True)
+    active_count = sum(status in {"running", "active", "waiting", "waiting_user_reply"} for _, status, _ in rows)
+    lines = ["会话监控（按最近活动排序）：", f"活动/等待会话：{active_count}"]
+    lines.extend(f"• {line}" for _, _, line in rows[:limit])
+    if len(rows) > limit:
+        lines.append(f"……另有 {len(rows) - limit} 个较早会话未显示")
+    return "\n".join(lines)
+
+
+def _collect_external_sessions() -> list[dict]:
+    """Return Claude/Codex summaries in one shape, newest first."""
+    records: list[dict] = []
+    for item in _load_global_sessions().values():
+        record = dict(item)
+        record["source"] = "claude"
+        record["status"] = "waiting" if item.get("waiting") else str(item.get("status", "unknown"))
+        record["monitor_key"] = f"claude:{record.get('session_id', '')}"
+        records.append(record)
+    for item in _load_codex_sessions().values():
+        record = dict(item)
+        record["source"] = "codex"
+        record["monitor_key"] = f"codex:{record.get('session_id', '')}"
+        records.append(record)
+    return sorted(records, key=lambda item: float(item.get("updated_at", 0) or 0), reverse=True)
+
+
+def _format_monitor_row(item: dict) -> str:
+    source = str(item.get("source", "?")).title()
+    session_id = str(item.get("session_id", ""))[:8] or "-"
+    status = _session_status_label(str(item.get("status", "unknown")))
+    project = _project_label(str(item.get("cwd", ""))) if item.get("cwd") else "-"
+    return f"[{source}] {session_id} | {status} | {project}"
+
+
+def _format_session_overview() -> str:
+    """Compact default view: actionable sessions then a few recent ones."""
+    records = _collect_external_sessions()
+    active_states = {"running", "active", "waiting", "waiting_user_reply"}
+    active = [item for item in records if item.get("status") in active_states]
+    recent = [item for item in records if item.get("status") not in active_states][:5]
+    shown = active + recent
+    if not shown:
+        return "暂无本机 Claude 或 Codex 会话记录。"
+    lines = ["会话监控："]
+    if active:
+        lines.append(f"正在运行/等待：{len(active)} 个")
+        lines.extend(f"🟢 {_format_monitor_row(item)}" for item in active)
+    else:
+        lines.append("当前没有运行或等待输入的会话。")
+    if recent:
+        lines.append("最近会话：")
+        lines.extend(f"• {_format_monitor_row(item)}" for item in recent)
+    lines.append("查看某个会话详情：/monitor codex:会话前8位 或 /monitor claude:会话前8位")
+    lines.append("查看全部历史会话：/monitor all")
+    return "\n".join(lines)
+
+
+def _monitor_button_choices() -> list[tuple[str, str]]:
+    """Build stable callbacks for the sessions shown in the compact overview."""
+    records = _collect_external_sessions()
+    active_states = {"running", "active", "waiting", "waiting_user_reply"}
+    visible = [item for item in records if item.get("status") in active_states]
+    visible.extend(item for item in records if item.get("status") not in active_states and item not in visible)
+    visible = visible[:12]
+    choices = []
+    for item in visible:
+        source = str(item.get("source", ""))
+        session_id = str(item.get("session_id", ""))
+        if not source or not session_id:
+            continue
+        label = f"{source.title()} {session_id[:8]} · {_session_status_label(str(item.get('status', 'unknown')))}"
+        choices.append((label, f"monitor:{source}:{session_id}"))
+    return choices
+
+
+def _resolve_monitored_session(selector: str) -> dict | None:
+    selector = selector.strip().lower()
+    if not selector:
+        return None
+    source = ""
+    prefix = selector
+    if ":" in selector:
+        source, prefix = selector.split(":", 1)
+    candidates = [
+        item for item in _collect_external_sessions()
+        if (not source or item.get("source") == source)
+        and str(item.get("session_id", "")).lower().startswith(prefix)
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _format_monitored_session_detail(item: dict) -> str:
+    updated_at = float(item.get("updated_at", 0) or 0)
+    age = max(0, int(time.time() - updated_at)) if updated_at else 0
+    source = str(item.get("source", "?")).title()
+    session_id = str(item.get("session_id", ""))
+    project = str(item.get("cwd", "")) or "-"
+    event = str(item.get("last_event", "")) or "-"
+    lines = [
+        f"{source} 会话详情",
+        f"会话：{session_id}",
+        f"状态：{_session_status_label(str(item.get('status', 'unknown')))}",
+        f"项目：{project}",
+        f"最后事件：{event[:160]}",
+        f"最后活动：{age}s 前",
+    ]
+    if item.get("waiting_reason"):
+        lines.append(f"等待原因：{str(item['waiting_reason'])[:400]}")
+    if str(item.get("source")) == "claude":
+        lines.append("如需让本机器人继续该 Claude 会话，可使用 /use <会话前8位>。")
+    else:
+        lines.append("Codex 会话为只读监控；请在原 Codex 终端或 Codex 客户端继续操作。")
+    return "\n".join(lines)
+
+
 def _format_waiting_message(session_id: str, item: dict) -> str:
     cwd = _project_label(item.get("cwd", ""))
     notification_type = str(item.get("notification_type") or "").strip()
@@ -489,10 +640,35 @@ _task_lock = asyncio.Lock()
 _current_task: Optional[asyncio.Task] = None
 _seen_global_event_offset = 0
 _last_waiting_notice: dict[str, str] = {}
+_external_session_states: dict[str, str] = {}
+_external_session_monitor_ready = False
+
+
+def _session_is_managed(session_id: str) -> bool:
+    return bool(session_id) and session_id in _state.sessions
+
+
+def _remember_waiting_notice(session_id: str, reason: str) -> bool:
+    reason = reason.strip()
+    if not session_id or not reason:
+        return False
+    previous = _last_waiting_notice.get(session_id)
+    _last_waiting_notice[session_id] = reason
+    return previous != reason
+
+
+def _prune_managed_waiting_notice(session_id: str) -> None:
+    if session_id:
+        _last_waiting_notice.pop(session_id, None)
 
 
 def _authorized(update: Update) -> bool:
-    return bool(update.effective_chat and update.effective_chat.id == config.ALLOWED_CHAT_ID)
+    """Check the sender identity for both Telegram and Feishu adapters."""
+    if not update.effective_chat:
+        return False
+    if config.BOT_CHANNEL == "feishu":
+        return str(update.effective_chat.id) == config.ALLOWED_FEISHU_OPEN_ID
+    return update.effective_chat.id == config.ALLOWED_CHAT_ID
 
 
 async def _send_unauthorized(update: Update):
@@ -524,17 +700,14 @@ async def _poll_global_sessions(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             continue
         session_id = str(event.get("session_id", ""))
-        if not session_id:
+        if not session_id or _session_is_managed(session_id):
             continue
         item = sessions.get(session_id, {})
         if not item.get("waiting"):
             continue
         reason = str(item.get("waiting_reason", "") or item.get("last_text", "")).strip()
-        if not reason:
+        if not reason or not _remember_waiting_notice(session_id, reason):
             continue
-        if _last_waiting_notice.get(session_id) == reason:
-            continue
-        _last_waiting_notice[session_id] = reason
         message = _format_waiting_message(session_id, item)
         options = item.get("choice_options") or []
         if options:
@@ -558,12 +731,45 @@ async def _poll_global_sessions(context: ContextTypes.DEFAULT_TYPE):
             await channel.send_text(message)
 
 
+async def _poll_external_session_status():
+    """Notify Feishu/Telegram only when a local external-session state changes."""
+    global _external_session_monitor_ready
+    snapshots: list[tuple[str, str, dict]] = []
+    for item in _load_global_sessions().values():
+        status = "waiting" if item.get("waiting") else str(item.get("status", "unknown"))
+        snapshots.append(("Claude", str(item.get("session_id", "")), {**item, "status": status}))
+    for item in await asyncio.to_thread(_load_codex_sessions):
+        snapshots.append(("Codex", str(item.get("session_id", "")), item))
+
+    current: dict[str, str] = {}
+    for source, session_id, item in snapshots:
+        if not session_id:
+            continue
+        key = f"{source}:{session_id}"
+        status = str(item.get("status", "unknown"))
+        current[key] = status
+        previous = _external_session_states.get(key)
+        if not _external_session_monitor_ready or previous == status:
+            continue
+        project = _project_label(str(item.get("cwd", ""))) if item.get("cwd") else "-"
+        event = str(item.get("last_event", ""))[:80] or "-"
+        icons = {"running": "🟢", "active": "🟢", "waiting": "🟡", "completed": "✅", "stopped": "⏹️", "stale": "⚠️"}
+        await channel.send_text(
+            f"{icons.get(status, 'ℹ️')} {source} 会话状态变化\n"
+            f"会话：{session_id[:8]}\n状态：{_session_status_label(status)}\n项目：{project}\n事件：{event}"
+        )
+    _external_session_states.clear()
+    _external_session_states.update(current)
+    _external_session_monitor_ready = True
+
+
 async def _run_agent(prompt: str, project_path: str, session_id: str):
     global _current_task
     snap = _state.ensure_project(project_path)
     try:
         outcome = await agent_runner.run_turn(prompt, project_path, session_id=session_id or None)
         _state.append_events(project_path, outcome.events)
+        active_session_id = outcome.session_id or session_id
         if outcome.session_id:
             session = _state.bind_session(outcome.session_id, project_path, initial_prompt=prompt)
             session.last_prompt = prompt.strip() or session.last_prompt
@@ -571,7 +777,6 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
             session.last_event = outcome.final_text[:120] if outcome.final_text else session.last_event
             session.updated_at = time.time()
             _state.current_session_id = outcome.session_id
-        active_session_id = outcome.session_id or session_id
         if outcome.state == "waiting":
             pending = PendingInteraction(
                 project_path=project_path,
@@ -582,12 +787,18 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
                 source="buttons" if outcome.choice_options else "text",
             )
             _state.mark_waiting(pending)
+            _remember_waiting_notice(pending.session_id, pending.prompt_text)
+            waiting_message = _format_waiting_message(
+                pending.session_id,
+                {
+                    "cwd": pending.project_path,
+                    "waiting_reason": pending.prompt_text,
+                    "last_text": pending.prompt_text,
+                    "notification_type": "",
+                },
+            )
             if pending.options:
-                choice = await channel.ask_choice(
-                    f"{pending.project_label} 会话 {pending.session_id[:8]} 有选项要你选：\n\n{pending.prompt_text}",
-                    pending.options,
-                    timeout=config.APPROVAL_TIMEOUT,
-                )
+                choice = await channel.ask_choice(waiting_message, pending.options, timeout=config.APPROVAL_TIMEOUT)
                 if choice is None:
                     _state.mark_waiting(pending)
                     await channel.send_text(
@@ -596,26 +807,29 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
                 else:
                     snap.add_entry("user/choice", choice, pending.session_id)
                     _state.mark_running(f"收到你的选择：{choice}", pending.project_path, pending.session_id)
+                    _prune_managed_waiting_notice(pending.session_id)
                     await channel.send_text(
                         f"你选择了：{choice}\n继续处理 {pending.project_label} / {pending.session_id[:8]}…"
                     )
                     _current_task = asyncio.create_task(_run_agent(choice, pending.project_path, pending.session_id))
                     return
             else:
-                await channel.send_text(
-                    f"{pending.project_label} 会话 {pending.session_id[:8]} 正在等你回复。"
-                )
+                await channel.send_text(waiting_message)
         elif _state.stop_requested:
+            _prune_managed_waiting_notice(active_session_id)
             _state.mark_done("任务已停止")
             await channel.send_text(f"{snap.label} 已停止。")
         else:
+            _prune_managed_waiting_notice(active_session_id)
             _state.mark_done("任务完成")
     except asyncio.CancelledError:
+        _prune_managed_waiting_notice(session_id)
         _state.mark_done("任务已取消")
         await channel.send_text(f"{snap.label} 已取消。")
         raise
     except Exception as e:
         log.exception("run_agent failed")
+        _prune_managed_waiting_notice(session_id)
         _state.mark_error(f"Agent 运行出错：{type(e).__name__}: {e}")
         await channel.send_text(f"{snap.label} 出错：{type(e).__name__}: {e}")
     finally:
@@ -624,20 +838,6 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
 
 
 # ---------------- 命令 ----------------
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        await _send_unauthorized(update)
-        return
-    projects = "\n".join(f"- {snap.label}: {snap.path}" for snap in _state.projects.values())
-    await update.message.reply_text(
-        "Claude 托管会话机器人已上线。\n\n"
-        f"当前项目：{_state.current_project_label}\n"
-        "监控项目：\n"
-        f"{projects}\n\n"
-        "直接发任务即可继续当前托管会话；/new 让下一条消息新开会话；/sessions 看会话；/use 切换会话；/status 看项目面板。"
-    )
-
 
 async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
@@ -685,14 +885,6 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        await _send_unauthorized(update)
-        return
-    text = _state.session_summary() + "\n\n全局 Claude 会话：\n" + "\n".join(_format_global_sessions())
-    await update.message.reply_text(text)
-
-
 async def cmd_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         await _send_unauthorized(update)
@@ -725,7 +917,93 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         await _send_unauthorized(update)
         return
-    await update.message.reply_text(_state.summary())
+    await update.message.reply_text(_state.summary() + "\n\n" + _format_session_overview())
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Welcome message followed by a clickable dashboard."""
+    if not _authorized(update):
+        await _send_unauthorized(update)
+        return
+    await update.message.reply_text(
+        "Claude / Codex 会话机器人已上线。\n"
+        "下方卡片可直接查看状态、监控会话、切换项目或新建会话。"
+    )
+    await channel.send_command_menu()
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        await _send_unauthorized(update)
+        return
+    await update.message.reply_text(
+        "常用操作请直接点击下方卡片。\n"
+        "也可发送 /monitor、/status、/sessions、/project、/new、/stop。"
+    )
+    await channel.send_command_menu()
+
+
+async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show managed sessions plus the unified local Claude/Codex monitor."""
+    if not _authorized(update):
+        await _send_unauthorized(update)
+        return
+    await update.message.reply_text(_state.session_summary() + "\n\n" + _format_session_overview())
+
+
+async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        await _send_unauthorized(update)
+        return
+    selector = " ".join(ctx.args).strip()
+    if not selector:
+        await update.message.reply_text(_format_session_overview())
+        await channel.send_monitor_choices("点击一个会话，查看详情：", _monitor_button_choices())
+        return
+    if selector.lower() == "all":
+        await update.message.reply_text(_format_all_sessions(limit=40))
+        return
+    item = _resolve_monitored_session(selector)
+    if item is None:
+        await update.message.reply_text(
+            "未找到唯一匹配的会话。请从 /monitor 列表复制来源和前 8 位 ID，"
+            "例如：/monitor codex:019fbd90"
+        )
+        return
+    await update.message.reply_text(_format_monitored_session_detail(item))
+
+
+async def _handle_dashboard_action(action: str, query):
+    """Run a common action from an inline/card button without fake messages."""
+    global _current_task
+    if action == "status":
+        await query.edit_message_text(_state.summary() + "\n\n" + _format_session_overview())
+    elif action == "monitor":
+        await query.edit_message_text(_format_session_overview())
+        await channel.send_monitor_choices("点击一个会话，查看详情：", _monitor_button_choices())
+    elif action == "sessions":
+        await query.edit_message_text(_state.session_summary() + "\n\n" + _format_session_overview())
+    elif action == "project":
+        choices = [(snap.label, f"project:{snap.label}") for snap in _state.projects.values()]
+        await query.edit_message_text(f"当前项目：{_state.current_project_label}\n请选择要切换的项目：")
+        await channel.send_project_choices(choices)
+    elif action == "new":
+        if _state.mode == "running":
+            await query.edit_message_text("当前任务仍在执行；结束后再新建会话。")
+        else:
+            _state.start_new_session_next = True
+            await query.edit_message_text("已标记：你下一条普通消息将创建一个新的 Claude 会话。")
+    elif action == "stop":
+        if _state.mode == "idle" or _current_task is None:
+            await query.edit_message_text("当前没有正在执行的机器人任务。")
+        else:
+            _state.request_stop()
+            agent_runner.request_stop()
+            if not _current_task.done():
+                _current_task.cancel()
+            await query.edit_message_text(f"已请求停止：{_state.current_project_label}")
+    else:
+        await query.edit_message_text("未知操作。请重新发送 /start 打开快捷面板。")
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -743,23 +1021,8 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"已请求停止：{_state.current_project_label}")
 
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(update):
-        await _send_unauthorized(update)
-        return
-    await update.message.reply_text(
-        "直接发文字 = 继续当前项目的当前会话（没有会话则新建）\n"
-        "/new 让下一条消息强制新开会话\n"
-        "/sessions 查看托管会话\n"
-        "/use <session_id前8位> 切换会话\n"
-        "/project <bot|doctor-wang|路径> 切项目\n"
-        "/status 查看项目面板 + 最近窗口\n"
-        "/stop 停止当前任务\n"
-        "如果 Claude 给出几个选项，我会优先发按钮让你点。"
-    )
-
-
 # ---------------- 按钮回调 ----------------
+
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
@@ -767,6 +1030,35 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     query = update.callback_query
     await query.answer()
+    if query.data.startswith("dashboard:"):
+        await _handle_dashboard_action(query.data.split(":", 1)[1], query)
+        return
+    if query.data.startswith("project:"):
+        if _state.mode == "running":
+            await query.edit_message_text("当前有任务正在执行，请先停止或等待它结束。")
+            return
+        label = query.data.split(":", 1)[1].strip().lower()
+        target = next((snap.path for snap in _state.projects.values() if snap.label.lower() == label), "")
+        if not target:
+            await query.edit_message_text("该项目已不在可切换列表中。请重新发送 /start。")
+            return
+        _state.set_current_project(target)
+        session = _state.get_current_session()
+        session_label = session.short_id if session else "无"
+        await query.edit_message_text(f"已切换到：{_state.current_project_label}\n当前会话：{session_label}")
+        return
+    if query.data.startswith("monitor:"):
+        try:
+            _, source, session_id = query.data.split(":", 2)
+        except ValueError:
+            await query.edit_message_text("会话按钮数据无效。请重新发送 /monitor。")
+            return
+        item = _resolve_monitored_session(f"{source}:{session_id}")
+        if item is None:
+            await query.edit_message_text("该会话已不在本机监控列表中。请重新发送 /monitor。")
+            return
+        await query.edit_message_text(_format_monitored_session_detail(item))
+        return
     choice = channel.resolve_approval(query.data)
     if choice is None:
         await query.edit_message_text(query.message.text + "\n\n（已失效/超时）")
@@ -840,16 +1132,91 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _background_poll_loop(app: Application):
+    await background_poll_loop()
+
+
+async def background_poll_loop():
+    """Shared session-monitor polling loop used by Telegram and Feishu."""
     while True:
         try:
+            await _poll_external_session_status()
             await _poll_global_sessions(None)
         except Exception:
             log.exception("global session poll failed")
-        await asyncio.sleep(3)
+        await asyncio.sleep(config.SESSION_MONITOR_POLL_SECONDS)
 
 
 async def _post_init(app: Application):
-    asyncio.create_task(_background_poll_loop(app))
+    asyncio.create_task(background_poll_loop())
+
+
+# ---------------- 飞书适配入口 ----------------
+
+class _FeishuChat:
+    def __init__(self, open_id: str):
+        self.id = open_id
+
+
+class _FeishuMessage:
+    def __init__(self, text: str, transport):
+        self.text = text
+        self._transport = transport
+
+    async def reply_text(self, text: str):
+        await self._transport.send_text(text)
+
+
+class _FeishuQuery:
+    def __init__(self, data: str, transport):
+        self.data = data
+        self._transport = transport
+        self.message = type("Message", (), {"text": "飞书交互卡片"})()
+
+    async def answer(self, *args, **kwargs):
+        return None
+
+    async def edit_message_text(self, text: str):
+        # Card updates need a message id. Sending a confirmation is clearer and
+        # works for both private chats and group chats without extra state.
+        await self._transport.send_text(text)
+
+
+class _FeishuUpdate:
+    def __init__(self, open_id: str, transport, text: str = "", callback_data: str = ""):
+        self.effective_chat = _FeishuChat(open_id)
+        self.message = _FeishuMessage(text, transport) if not callback_data else None
+        self.callback_query = _FeishuQuery(callback_data, transport) if callback_data else None
+
+
+class _FeishuContext:
+    def __init__(self, args: list[str] | None = None):
+        self.args = args or []
+
+
+async def dispatch_feishu_text(open_id: str, chat_id: str, text: str, transport):
+    """Translate a Feishu text event into the existing command/message core."""
+    transport.set_chat_id(chat_id)
+    update = _FeishuUpdate(open_id, transport, text=text)
+    if not text:
+        return
+    command, _, remainder = text.partition(" ")
+    handlers = {
+        "/start": cmd_start, "/help": cmd_help, "/project": cmd_project,
+        "/new": cmd_new, "/sessions": cmd_sessions, "/use": cmd_use,
+        "/status": cmd_status, "/monitor": cmd_monitor, "/stop": cmd_stop,
+    }
+    handler = handlers.get(command.lower())
+    if handler:
+        await handler(update, _FeishuContext(remainder.split() if remainder else []))
+    else:
+        await on_message(update, _FeishuContext())
+
+
+async def dispatch_feishu_button(open_id: str, callback_data: str, transport):
+    """Translate a Feishu interactive-card button click into the shared flow."""
+    if not callback_data:
+        return
+    await on_button(_FeishuUpdate(open_id, transport, callback_data=callback_data), _FeishuContext())
 
 
 # ---------------- 启动 ----------------
@@ -862,6 +1229,12 @@ def main():
     for path in config.DEFAULT_PROJECTS:
         os.makedirs(path, exist_ok=True)
 
+    if config.BOT_CHANNEL == "feishu":
+        from feishu_bridge import run as run_feishu
+        log.info("启动飞书长连接机器人，工作目录=%s", _state.current_cwd)
+        run_feishu()
+        return
+
     app = Application.builder().token(config.TELEGRAM_TOKEN).post_init(_post_init).build()
 
     channel.init(app.bot, config.ALLOWED_CHAT_ID)
@@ -873,6 +1246,7 @@ def main():
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("use", cmd_use))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("monitor", cmd_monitor))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))

@@ -38,6 +38,7 @@ SYSTEM_PROMPT = """你是一个常驻在用户家里 Windows 电脑上的编程�
 
 _stop_requested = False
 _active_process: Optional[asyncio.subprocess.Process] = None
+_last_sent_reply_by_session: dict[str, str] = {}
 
 
 @dataclass
@@ -79,6 +80,8 @@ async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> Turn
     """跑一回合；session_id 为空时新建会话，否则继续指定会话。"""
     await _ensure_claude_available()
     _reset_stop_flag()
+    if session_id:
+        _clear_forwarded_reply(session_id)
 
     outcome = TurnOutcome(session_id=session_id or "")
     system_prompt = SYSTEM_PROMPT.format(rules=build_supervisor_rules_text())
@@ -180,7 +183,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
             await channel.send_status(f"思考中：{thinking[:120]}")
         if text:
             outcome.events.append(MirrorEvent(kind="assistant/text", text=text, session_id=session_id))
-            await channel.send_text(text)
+            if _should_forward_reply(session_id or outcome.session_id, text):
+                await channel.send_text(text)
             options = _parse_options(text)
             if options:
                 outcome.waiting_text = text
@@ -201,7 +205,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
             outcome.final_text = result
             outcome.events.append(MirrorEvent(kind=kind, text=result, session_id=session_id))
             if subtype == "success":
-                await channel.send_text(result)
+                if _should_forward_reply(session_id, result):
+                    await channel.send_text(result)
                 options = _parse_options(result)
                 if options:
                     outcome.waiting_text = result
@@ -253,6 +258,24 @@ def _extract_thinking(message: dict) -> str:
             if text:
                 parts.append(text)
     return "\n\n".join(parts).strip()
+
+
+def _reply_fingerprint(text: str) -> str:
+    return text.strip()[:400]
+
+
+def _should_forward_reply(session_id: str, text: str) -> bool:
+    fingerprint = _reply_fingerprint(text)
+    if not fingerprint:
+        return False
+    previous = _last_sent_reply_by_session.get(session_id)
+    _last_sent_reply_by_session[session_id] = fingerprint
+    return previous != fingerprint
+
+
+def _clear_forwarded_reply(session_id: str) -> None:
+    if session_id:
+        _last_sent_reply_by_session.pop(session_id, None)
 
 
 def _parse_options(text: str) -> list[str]:
