@@ -150,6 +150,7 @@ class RuntimeState:
     pending: Optional[PendingInteraction] = None
     start_new_session_next: bool = False
     task_queue: list[QueuedTask] = field(default_factory=list)
+    active_task: Optional[dict] = None
 
     def ensure_project(self, path: str) -> ProjectSnapshot:
         norm = _norm_path(path)
@@ -229,6 +230,12 @@ class RuntimeState:
         self.last_error = ""
         self.pending = None
         self.start_new_session_next = False
+        self.active_task = {
+            "prompt": self.active_prompt,
+            "project_path": norm,
+            "session_id": session_id or "",
+            "task_id": self.current_task_id,
+        }
         action = "新会话" if force_new or not session_id else f"继续会话 {session_id[:8]}"
         self.last_event = f"{snap.label} 开始处理（{action}）"
         snap.mode = "running"
@@ -270,6 +277,7 @@ class RuntimeState:
         snap = self.ensure_project(target_path)
         self.mode = "running"
         self.waiting_reason = ""
+        self.pending = None
         self.last_event = event
         self.current_cwd = target_path
         self.current_project_label = snap.label
@@ -296,6 +304,7 @@ class RuntimeState:
         self.current_task_id = None
         self.pending = None
         self.start_new_session_next = False
+        self.active_task = None
         snap.mode = "idle"
         snap.last_event = event
         snap.waiting_reason = ""
@@ -320,6 +329,7 @@ class RuntimeState:
         self.current_task_id = None
         self.pending = None
         self.start_new_session_next = False
+        self.active_task = None
         snap.mode = "idle"
         snap.last_error = error
         snap.last_event = error
@@ -445,6 +455,19 @@ def _dump_state(state: RuntimeState) -> dict:
         "current_cwd": state.current_cwd,
         "current_session_id": state.current_session_id,
         "project_last_session": dict(state.project_last_session),
+        "task_counter": state.task_counter,
+        "task_queue": [
+            {
+                "prompt": task.prompt,
+                "project_path": task.project_path,
+                "session_id": task.session_id,
+                "force_new": task.force_new,
+                "task_number": task.task_number,
+                "queued_at": task.queued_at,
+            }
+            for task in state.task_queue
+        ],
+        "active_task": dict(state.active_task) if state.active_task else None,
         "sessions": [
             {
                 "session_id": session.session_id,
@@ -511,6 +534,43 @@ def _apply_state(state: RuntimeState, data: dict) -> None:
         for k, v in data.get("project_last_session", {}).items()
         if str(v) in state.sessions
     }
+
+    state.task_counter = max(state.task_counter, int(data.get("task_counter") or 0))
+    for item in data.get("task_queue") or []:
+        if not isinstance(item, dict):
+            continue
+        prompt = str(item.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        state.task_queue.append(
+            QueuedTask(
+                prompt=prompt,
+                project_path=_norm_path(item.get("project_path") or state.current_cwd),
+                session_id=str(item.get("session_id") or ""),
+                force_new=bool(item.get("force_new")),
+                task_number=int(item.get("task_number") or 0),
+                queued_at=float(item.get("queued_at", time.time()) or time.time()),
+            )
+        )
+
+    # If the bot died mid-task, resume that task first after restart.
+    active_task = data.get("active_task")
+    if isinstance(active_task, dict):
+        prompt = str(active_task.get("prompt") or "").strip()
+        if prompt:
+            task_id = int(active_task.get("task_id") or 0)
+            state.task_counter = max(state.task_counter, task_id)
+            state.task_queue.insert(
+                0,
+                QueuedTask(
+                    prompt=prompt,
+                    project_path=_norm_path(active_task.get("project_path") or state.current_cwd),
+                    session_id=str(active_task.get("session_id") or ""),
+                    force_new=False,
+                    task_number=max(task_id, state.task_counter),
+                    queued_at=time.time(),
+                ),
+            )
 
     for item in data.get("projects") or []:
         if not isinstance(item, dict):
@@ -923,22 +983,15 @@ async def _poll_global_sessions(context: ContextTypes.DEFAULT_TYPE):
         message = _format_waiting_message(session_id, {**item, "source": "claude"})
         options = item.get("choice_options") or []
         if options:
-            choice = await channel.ask_choice(message, options, timeout=config.APPROVAL_TIMEOUT)
-            if choice is not None:
-                adopted = _adopt_global_session(session_id)
-                if adopted is not None:
-                    _state.pending = PendingInteraction(
-                        project_path=adopted.project_path,
-                        project_label=adopted.project_label,
-                        session_id=session_id,
-                        prompt_text=reason,
-                        options=options,
-                        source="buttons",
+            adopted = _adopt_global_session(session_id)
+            if adopted is not None:
+                # _adopt_global_session sets _state.pending; the button click
+                # (on_button) will resolve it and continue the session.
+                choice_id = await channel.send_choice_no_wait(message, options)
+                if choice_id is not None:
+                    asyncio.create_task(
+                        _expire_waiting(_state.pending, choice_id, config.APPROVAL_TIMEOUT)
                     )
-                    _state.set_current_project(adopted.project_path)
-                    _state.current_session_id = session_id
-                    _state.mark_running(f"收到你的选择：{choice}", adopted.project_path, session_id)
-                    asyncio.create_task(_run_agent(choice, adopted.project_path, session_id))
         else:
             await channel.send_text(message)
 
@@ -1009,24 +1062,17 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
                     "waiting_reason": pending.prompt_text,
                     "last_text": pending.prompt_text,
                     "notification_type": "",
+                    "source": "codex",
                 },
             )
             if pending.options:
-                choice = await channel.ask_choice(waiting_message, pending.options, timeout=config.APPROVAL_TIMEOUT)
-                if choice is None:
-                    _state.mark_waiting(pending)
-                    await channel.send_text(
-                        f"{pending.project_label} 会话 {pending.session_id[:8]} 选择超时，你也可以直接发文字继续。"
-                    )
-                else:
-                    snap.add_entry("user/choice", choice, pending.session_id)
-                    _state.mark_running(f"收到你的选择：{choice}", pending.project_path, pending.session_id)
-                    _prune_managed_waiting_notice(pending.session_id)
-                    await channel.send_text(
-                        f"你选择了：{choice}\n继续处理 {pending.project_label} / {pending.session_id[:8]}…"
-                    )
-                    _current_task = asyncio.create_task(_run_agent(choice, pending.project_path, pending.session_id))
-                    return
+                # Non-blocking: the card is sent and this task returns.  A
+                # button click (on_button) or a text reply (on_message) will
+                # continue the same session; the expiry task invalidates the
+                # buttons after APPROVAL_TIMEOUT.
+                choice_id = await channel.send_choice_no_wait(waiting_message, pending.options)
+                if choice_id is not None:
+                    asyncio.create_task(_expire_waiting(pending, choice_id, config.APPROVAL_TIMEOUT))
             else:
                 await channel.send_text(waiting_message)
         elif _state.stop_requested:
@@ -1063,6 +1109,17 @@ async def _heartbeat_loop(snap: ProjectSnapshot, prompt: str, started_at: float)
         await channel.send_status(
             f"⏳ {snap.label} 任务仍在执行… 已运行 {elapsed}s\n"
             f"内容：{prompt[:80]}"
+        )
+
+
+async def _expire_waiting(pending: PendingInteraction, choice_id: str | None, timeout: int):
+    """Invalidate choice buttons after the approval timeout."""
+    await asyncio.sleep(timeout)
+    if choice_id:
+        channel.expire_choice(choice_id)
+    if _state.pending is pending:
+        await channel.send_text(
+            f"⏰ 选择超时（{timeout}s）。按钮已失效，你也可以直接发文字继续。"
         )
 
 
@@ -1402,24 +1459,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     async with _task_lock:
-        busy = _state.mode == "running" or (_current_task is not None and not _current_task.done())
-        if busy:
-            force_new = _state.start_new_session_next
-            _state.start_new_session_next = False
-            session_id = _state.choose_session_for_prompt(force_new)
-            queued = _state.enqueue_task(prompt, _state.current_cwd, session_id, force_new)
-            await update.message.reply_text(
-                f"⏳ 当前有任务在执行，已加入队列。\n"
-                f"队列位置：{len(_state.task_queue)} | 任务编号：#{queued.task_number}\n"
-                f"项目：{_state.current_project_label}\n"
-                f"内容：{prompt[:100]}\n"
-                "可用 /queue 查看，/queue clear 清空。"
-            )
-            return
-
         pending = _state.pending
         is_followup = _state.mode == "waiting_user_reply" and pending is not None
         if is_followup:
+            _prune_managed_waiting_notice(pending.session_id)
             session_id = pending.session_id
             target_path = pending.project_path
             _state.set_current_project(target_path)
@@ -1430,23 +1473,38 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"继续处理：{pending.project_label} / {session_id[:8]}"
             )
         else:
-            target_path = _state.current_cwd
-            force_new = _state.start_new_session_next
-            session_id = _state.choose_session_for_prompt(force_new)
-            if session_id and session_id not in _state.sessions:
-                adopted = _adopt_global_session(session_id)
-                if adopted is not None:
-                    target_path = adopted.project_path
-                    _state.current_cwd = adopted.project_path
-                    _state.current_project_label = adopted.project_label
-            _state.start_task(prompt, target_path, session_id, force_new)
-            action = "新会话" if force_new or not session_id else f"继续会话 {session_id[:8]}"
-            await update.message.reply_text(
-                f"已开始任务 #{_state.current_task_id}\n"
-                f"项目：{_state.current_project_label}\n"
-                f"模式：{action}\n"
-                f"内容：{prompt[:120]}"
-            )
+            busy = _state.mode == "running" or (_current_task is not None and not _current_task.done())
+            if busy:
+                force_new = _state.start_new_session_next
+                _state.start_new_session_next = False
+                session_id = _state.choose_session_for_prompt(force_new)
+                queued = _state.enqueue_task(prompt, _state.current_cwd, session_id, force_new)
+                await update.message.reply_text(
+                    f"⏳ 当前有任务在执行，已加入队列。\n"
+                    f"队列位置：{len(_state.task_queue)} | 任务编号：#{queued.task_number}\n"
+                    f"项目：{_state.current_project_label}\n"
+                    f"内容：{prompt[:100]}\n"
+                    "可用 /queue 查看，/queue clear 清空。"
+                )
+                return
+            else:
+                target_path = _state.current_cwd
+                force_new = _state.start_new_session_next
+                session_id = _state.choose_session_for_prompt(force_new)
+                if session_id and session_id not in _state.sessions:
+                    adopted = _adopt_global_session(session_id)
+                    if adopted is not None:
+                        target_path = adopted.project_path
+                        _state.current_cwd = adopted.project_path
+                        _state.current_project_label = adopted.project_label
+                _state.start_task(prompt, target_path, session_id, force_new)
+                action = "新会话" if force_new or not session_id else f"继续会话 {session_id[:8]}"
+                await update.message.reply_text(
+                    f"已开始任务 #{_state.current_task_id}\n"
+                    f"项目：{_state.current_project_label}\n"
+                    f"模式：{action}\n"
+                    f"内容：{prompt[:120]}"
+                )
 
         _current_task = asyncio.create_task(_run_agent(prompt, target_path, session_id))
 
@@ -1469,6 +1527,7 @@ async def background_poll_loop():
 async def _post_init(app: Application):
     asyncio.create_task(background_poll_loop())
     asyncio.create_task(_autosave_loop())
+    asyncio.create_task(_drain_queue_if_idle())
 
 
 # ---------------- 飞书适配入口 ----------------

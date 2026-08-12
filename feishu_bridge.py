@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,9 @@ import config
 
 log = logging.getLogger("feishu")
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CHAT_ID_FILE = os.path.join(PROJECT_ROOT, "logs", "last_chat_id")
+
 
 class FeishuTransport:
     def __init__(self, client: Any):
@@ -24,12 +28,25 @@ class FeishuTransport:
         self.chat_id = ""
 
     def set_chat_id(self, chat_id: str) -> None:
-        if chat_id:
+        if chat_id and chat_id != self.chat_id:
             self.chat_id = chat_id
+            self._remember_chat_id(chat_id)
+
+    @staticmethod
+    def _remember_chat_id(chat_id: str) -> None:
+        """Persist the reply target so a restart does not forget where to send."""
+        try:
+            os.makedirs(os.path.dirname(CHAT_ID_FILE), exist_ok=True)
+            with open(CHAT_ID_FILE, "w", encoding="utf-8") as fh:
+                fh.write(chat_id)
+        except Exception:
+            log.warning("无法持久化 chat_id", exc_info=True)
 
     async def send_text(self, text: str, chat_id: str = "") -> None:
         target = chat_id or self.chat_id
         if not target or not text:
+            if text and not target:
+                log.warning("send_text 被跳过：chat_id 为空（尚未收到过任何飞书消息，无法知道回复给谁）")
             return
         # Feishu text messages have a 150 KiB content limit.  A smaller chunk
         # also keeps long Claude output readable in the mobile client.
@@ -209,6 +226,15 @@ def run() -> None:
     asyncio.set_event_loop(loop)
     client = lark.Client.builder().app_id(config.FEISHU_APP_ID).app_secret(config.FEISHU_APP_SECRET).build()
     transport = FeishuTransport(client)
+    if os.path.exists(CHAT_ID_FILE):
+        try:
+            with open(CHAT_ID_FILE, "r", encoding="utf-8") as fh:
+                saved_chat_id = fh.read().strip()
+            if saved_chat_id:
+                transport.chat_id = saved_chat_id
+                log.info("已恢复上次的回复目标 chat_id=%s", saved_chat_id)
+        except Exception:
+            log.warning("无法读取上次保存的 chat_id", exc_info=True)
     channel.init_feishu(transport)
 
     def schedule(coro):
@@ -241,9 +267,14 @@ def run() -> None:
             return
         log.info("Feishu text payload parsed: %r", text[:200])
         if open_id != config.ALLOWED_FEISHU_OPEN_ID:
-            log.warning("Ignored Feishu message from open_id=%s", open_id)
+            log.warning(
+                "Ignored Feishu message from open_id=%s（ALLOWED=%s）",
+                open_id,
+                config.ALLOWED_FEISHU_OPEN_ID,
+            )
             return
         schedule(bot.dispatch_feishu_text(open_id, chat_id, text, transport))
+        log.info("Feishu 消息已提交主循环处理：open_id=%s chat_id=%s", open_id, chat_id)
 
     def on_card_action(data: Any) -> dict:
         event = data.event
@@ -271,16 +302,27 @@ def run() -> None:
     )
     ws_client = lark.ws.Client(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, event_handler=handler)
 
+    def _ws_start() -> None:
+        try:
+            ws_client.start()
+        except Exception:
+            log.exception("Feishu ws client start failed")
+
     async def serve() -> None:
         asyncio.create_task(bot.background_poll_loop())
         asyncio.create_task(bot._autosave_loop())
+        asyncio.create_task(bot._drain_queue_if_idle())
         # Run the WebSocket client in a daemon thread so a Ctrl+C / SIGTERM
         # can actually terminate the process instead of hanging on shutdown.
-        worker = threading.Thread(target=ws_client.start, daemon=True, name="feishu-ws")
-        worker.start()
-        while worker.is_alive():
-            await asyncio.sleep(1)
-        log.error("Feishu 长连接已退出，进程即将结束")
+        # If the thread dies (network drop the SDK cannot recover from), keep
+        # the bot process alive and restart the connection instead of exiting.
+        while True:
+            worker = threading.Thread(target=_ws_start, daemon=True, name="feishu-ws")
+            worker.start()
+            while worker.is_alive():
+                await asyncio.sleep(1)
+            log.error("Feishu 长连接线程已退出，5 秒后自动重连")
+            await asyncio.sleep(5)
 
     log.info("Feishu bridge started; waiting for long-connection events")
     loop.run_until_complete(serve())

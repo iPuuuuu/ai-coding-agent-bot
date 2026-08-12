@@ -87,10 +87,33 @@ async def ask_choice(text: str, options: list[str], timeout: int) -> str | None:
     if (not _bot and _feishu is None) or not options:
         return None
 
-    choice_id = uuid.uuid4().hex[:8]
+    choice_id = await send_choice_no_wait(text, options)
+    if choice_id is None:
+        return None
+
     loop = asyncio.get_event_loop()
     fut: asyncio.Future = loop.create_future()
     _pending[choice_id] = {"future": fut, "options": options}
+
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        _pending.pop(choice_id, None)
+        await send_text(f"⏰ 选择超时（{timeout}s）")
+        return None
+
+
+async def send_choice_no_wait(text: str, options: list[str]) -> str | None:
+    """Send a choice card and return its id WITHOUT blocking for the answer.
+
+    The button callback (``resolve_approval``) resolves the pending entry later;
+    the caller may schedule its own timeout instead of awaiting here.
+    """
+    if (not _bot and _feishu is None) or not options:
+        return None
+
+    choice_id = uuid.uuid4().hex[:8]
+    _pending[choice_id] = {"future": None, "options": options}
 
     if _feishu is not None:
         await _feishu.send_choice(text, options, choice_id)
@@ -100,13 +123,7 @@ async def ask_choice(text: str, options: list[str], timeout: int) -> str | None:
             [[InlineKeyboardButton(label[:32], callback_data=f"pick:{choice_id}:{idx}")] for idx, label in enumerate(options)]
         )
         await _bot.send_message(chat_id=_chat_id, text=text, reply_markup=keyboard)
-
-    try:
-        return await asyncio.wait_for(fut, timeout=timeout)
-    except asyncio.TimeoutError:
-        _pending.pop(choice_id, None)
-        await send_text(f"⏰ 选择超时（{timeout}s）")
-        return None
+    return choice_id
 
 
 async def ask_approval(text: str, timeout: int, timeout_action: str) -> bool:
@@ -128,17 +145,25 @@ def resolve_approval(callback_data: str) -> str | None:
     item = _pending.pop(pending_id, None)
     if not item:
         return None
-    fut: asyncio.Future = item["future"]
+    fut: asyncio.Future | None = item["future"]
     options: list[str] = item["options"]
     try:
         index = int(raw_index)
     except ValueError:
         index = -1
-    if fut.done() or not (0 <= index < len(options)):
+    if not (0 <= index < len(options)):
         return None
     choice = options[index]
-    fut.set_result(choice)
+    if fut is not None:
+        if fut.done():
+            return None
+        fut.set_result(choice)
     return choice
+
+
+def expire_choice(choice_id: str) -> None:
+    """Invalidate a pending choice (called when the wait times out)."""
+    _pending.pop(choice_id, None)
 
 
 async def send_monitor_choices(text: str, choices: list[tuple[str, str]]):

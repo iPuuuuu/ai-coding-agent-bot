@@ -182,6 +182,10 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
+        # Codex prints this banner on stderr/stdout when stdin is not a TTY;
+        # it is noise, not an agent reply.
+        if line.strip() == "Reading additional input from stdin...":
+            return False
         outcome.events.append(MirrorEvent(kind="raw/non_json", text=line, session_id=outcome.session_id))
         await channel.send_text(line)
         return False
