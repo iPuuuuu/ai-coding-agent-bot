@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.a1234.ai-coding-agent-bot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/a1234/ai-coding-agent-bot/.venv/bin/python</string>
+        <string>/Users/a1234/ai-coding-agent-bot/bot.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/a1234/ai-coding-agent-bot</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/a1234</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/a1234/ai-coding-agent-bot/logs/bot.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/a1234/ai-coding-agent-bot/logs/bot.err.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -166,6 +166,7 @@ async def send_command_menu():
         ("🖥️ 会话监控", "dashboard:monitor"),
         ("💬 托管会话", "dashboard:sessions"),
         ("📁 切换项目", "dashboard:project"),
+        ("📋 任务队列", "dashboard:queue"),
         ("➕ 新建会话", "dashboard:new"),
         ("⏹️ 停止任务", "dashboard:stop"),
     ]

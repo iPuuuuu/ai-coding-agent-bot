@@ -73,6 +73,6 @@ scripts/stop_all.sh  # 清理历史上遗留的多实例
 
 - 图片/截图会作为飞书图片发送。
 - 长回复会自动分段。
-- 可用命令：`/start /help /status /monitor /sessions /use /new /project /stop /health`。
+- 可用命令：`/start /help /status /monitor /sessions /use /new /project /stop /queue /health`。
 - 当前服务的会话状态与原 Telegram 实现一致，是全局单会话执行模型。在群聊里，输出会发往最近一次收到授权用户消息的会话；建议优先使用私聊。若要多群并行且会话完全隔离，需要进一步将 `RuntimeState` 按 `chat_id` 拆分。
 - 保留 `BOT_CHANNEL=telegram` 或不配置该项时，原 Telegram 行为不受影响。

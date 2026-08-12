@@ -16,6 +16,7 @@ import os
 import shutil
 import time
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 from telegram import Update
@@ -39,10 +40,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join("logs", "bot.log"), encoding="utf-8"),
+        RotatingFileHandler(
+            os.path.join("logs", "bot.log"),
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
     ],
 )
 log = logging.getLogger("bot")
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "state.json")
 
 
 @dataclass
@@ -61,6 +69,16 @@ class PendingInteraction:
     prompt_text: str
     options: list[str] = field(default_factory=list)
     source: str = "text"  # text | buttons
+
+
+@dataclass
+class QueuedTask:
+    prompt: str
+    project_path: str
+    session_id: str
+    force_new: bool = False
+    task_number: int = 0
+    queued_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -131,6 +149,7 @@ class RuntimeState:
     project_last_session: dict[str, str] = field(default_factory=dict)
     pending: Optional[PendingInteraction] = None
     start_new_session_next: bool = False
+    task_queue: list[QueuedTask] = field(default_factory=list)
 
     def ensure_project(self, path: str) -> ProjectSnapshot:
         norm = _norm_path(path)
@@ -325,6 +344,33 @@ class RuntimeState:
             session.last_event = self.last_event
             session.updated_at = time.time()
 
+    def enqueue_task(self, prompt: str, project_path: str, session_id: str, force_new: bool) -> QueuedTask:
+        """Add a task to the FIFO queue while another task is running."""
+        self.task_counter += 1
+        task = QueuedTask(
+            prompt=prompt.strip(),
+            project_path=_norm_path(project_path),
+            session_id=session_id,
+            force_new=force_new,
+            task_number=self.task_counter,
+        )
+        self.task_queue.append(task)
+        self.last_event = f"任务 #{task.task_number} 已排队"
+        snap = self.ensure_project(task.project_path)
+        snap.last_event = self.last_event
+        snap.add_entry("system", self.last_event, session_id)
+        return task
+
+    def pop_next_queued(self) -> QueuedTask | None:
+        return self.task_queue.pop(0) if self.task_queue else None
+
+    def clear_queue(self) -> int:
+        count = len(self.task_queue)
+        self.task_queue.clear()
+        if count:
+            self.last_event = f"已清空队列（移除 {count} 个任务）"
+        return count
+
     def append_events(self, project_path: str, events: list[agent_runner.MirrorEvent]):
         snap = self.ensure_project(project_path)
         for event in events:
@@ -390,6 +436,142 @@ def _norm_path(path: str) -> str:
 def _project_label(path: str) -> str:
     base = os.path.basename(_norm_path(path))
     return base or _norm_path(path)
+
+
+def _dump_state(state: RuntimeState) -> dict:
+    """Serialize managed sessions, project windows and focus for restart."""
+    return {
+        "version": 1,
+        "current_cwd": state.current_cwd,
+        "current_session_id": state.current_session_id,
+        "project_last_session": dict(state.project_last_session),
+        "sessions": [
+            {
+                "session_id": session.session_id,
+                "project_path": session.project_path,
+                "project_label": session.project_label,
+                "title": session.title,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
+                "last_prompt": session.last_prompt,
+                "last_event": session.last_event,
+                "mode": session.mode,
+            }
+            for session in state.sessions.values()
+        ],
+        "projects": [
+            {
+                "path": snap.path,
+                "label": snap.label,
+                "last_event": snap.last_event,
+                "last_error": snap.last_error,
+                "last_active_at": snap.last_active_at,
+                "transcript": [
+                    {
+                        "kind": entry.kind,
+                        "text": entry.text,
+                        "session_id": entry.session_id,
+                        "timestamp": entry.timestamp,
+                    }
+                    for entry in snap.transcript
+                ],
+            }
+            for snap in state.projects.values()
+        ],
+    }
+
+
+def _apply_state(state: RuntimeState, data: dict) -> None:
+    """Restore a previously dumped state into ``state`` (best-effort)."""
+    if not isinstance(data, dict):
+        return
+
+    for item in data.get("sessions") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            session_id = str(item["session_id"])
+        except (KeyError, TypeError):
+            continue
+        session = ManagedSession(
+            session_id=session_id,
+            project_path=_norm_path(item.get("project_path", config.DEFAULT_PROJECT_DIR)),
+            project_label=str(item.get("project_label") or _project_label(item.get("project_path", ""))),
+            title=str(item.get("title") or "新会话")[:48],
+            created_at=float(item.get("created_at", time.time()) or time.time()),
+            updated_at=float(item.get("updated_at", time.time()) or time.time()),
+            last_prompt=str(item.get("last_prompt", "")),
+            last_event=str(item.get("last_event") or "重启恢复"),
+            mode="idle",  # never restore a running/waiting session as live
+        )
+        state.sessions[session_id] = session
+
+    state.project_last_session = {
+        str(k): str(v)
+        for k, v in data.get("project_last_session", {}).items()
+        if str(v) in state.sessions
+    }
+
+    for item in data.get("projects") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "")
+        if not path:
+            continue
+        snap = state.ensure_project(path)
+        snap.last_event = str(item.get("last_event") or "重启恢复")
+        snap.last_error = str(item.get("last_error") or "")
+        snap.last_active_at = item.get("last_active_at")
+        for entry in item.get("transcript", [])[-80:]:
+            if not isinstance(entry, dict):
+                continue
+            snap.add_entry(
+                str(entry.get("kind") or "system"),
+                str(entry.get("text") or ""),
+                str(entry.get("session_id") or ""),
+            )
+
+    if data.get("current_cwd") in state.projects:
+        state.set_current_project(str(data["current_cwd"]))
+    current_session_id = str(data.get("current_session_id") or "")
+    if current_session_id in state.sessions:
+        state.current_session_id = current_session_id
+        state.sessions[current_session_id].mode = "idle"
+        state.sessions[current_session_id].last_event += "（重启恢复）"
+    state.start_new_session_next = False
+
+
+def _save_state() -> None:
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_dump_state(_state), fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        log.exception("state save failed")
+
+
+def _load_state() -> None:
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        log.warning("state file unreadable, starting fresh", exc_info=True)
+        return
+    _apply_state(_state, data)
+    log.info("已从 %s 恢复 %d 个托管会话", STATE_FILE, len(_state.sessions))
+
+
+async def _autosave_loop() -> None:
+    interval = config.STATE_AUTOSAVE_SECONDS
+    if interval <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval)
+        _save_state()
 
 
 def _resolve_session_id(prefix: str) -> str:
@@ -665,6 +847,7 @@ _state = RuntimeState()
 for _path in config.DEFAULT_PROJECTS:
     _state.ensure_project(_path)
 _state.set_current_project(config.DEFAULT_PROJECT_DIR)
+_load_state()
 _task_lock = asyncio.Lock()
 _current_task: Optional[asyncio.Task] = None
 _seen_global_event_offset = 0
@@ -866,8 +1049,7 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
         await channel.send_text(f"{snap.label} 出错：{type(e).__name__}: {e}")
     finally:
         heartbeat.cancel()
-        if _current_task is not None and _current_task.done():
-            _current_task = None
+        await _drain_queue_if_idle()
 
 
 async def _heartbeat_loop(snap: ProjectSnapshot, prompt: str, started_at: float):
@@ -882,6 +1064,23 @@ async def _heartbeat_loop(snap: ProjectSnapshot, prompt: str, started_at: float)
             f"⏳ {snap.label} 任务仍在执行… 已运行 {elapsed}s\n"
             f"内容：{prompt[:80]}"
         )
+
+
+async def _drain_queue_if_idle() -> None:
+    """Start the next queued task once the current one is fully idle."""
+    global _current_task
+    while _state.mode == "idle" and _state.task_queue:
+        queued = _state.pop_next_queued()
+        if queued is None:
+            break
+        _state.start_task(queued.prompt, queued.project_path, queued.session_id, queued.force_new)
+        snap = _state.ensure_project(queued.project_path)
+        await channel.send_text(
+            f"▶️ 开始队列任务 #{queued.task_number}：{queued.prompt[:80]}\n"
+            f"项目：{snap.label}"
+        )
+        _current_task = asyncio.create_task(_run_agent(queued.prompt, queued.project_path, queued.session_id))
+        return
 
 
 # ---------------- 命令 ----------------
@@ -986,7 +1185,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "常用操作请直接点击下方卡片。\n"
-        "也可发送 /monitor、/status、/sessions、/project、/new、/use、/stop、/health。"
+        "也可发送 /monitor、/status、/sessions、/project、/new、/use、/stop、/queue、/health。"
     )
     await channel.send_command_menu()
 
@@ -1019,6 +1218,27 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     if config.CODEX_MODEL:
         lines.append(f"Codex 模型：{config.CODEX_MODEL}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show / clear the pending task queue."""
+    if not _authorized(update):
+        await _send_unauthorized(update)
+        return
+    if ctx.args and ctx.args[0].lower() in {"clear", "清空"}:
+        removed = _state.clear_queue()
+        await update.message.reply_text(f"已清空队列（移除 {removed} 个任务）。")
+        return
+    if not _state.task_queue:
+        await update.message.reply_text("队列为空，当前没有排队中的任务。")
+        return
+    lines = [f"任务队列（共 {len(_state.task_queue)} 个）："]
+    for index, task in enumerate(_state.task_queue, start=1):
+        lines.append(
+            f"{index}. #{task.task_number} | {_project_label(task.project_path)} | {task.prompt[:60]}"
+        )
+    lines.append("用法：/queue clear 清空队列。")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1066,6 +1286,16 @@ async def _handle_dashboard_action(action: str, query):
         choices = [(snap.label, f"project:{snap.label}") for snap in _state.projects.values()]
         await query.edit_message_text(f"当前项目：{_state.current_project_label}\n请选择要切换的项目：")
         await channel.send_project_choices(choices)
+    elif action == "queue":
+        if not _state.task_queue:
+            await query.edit_message_text("队列为空，当前没有排队中的任务。")
+        else:
+            lines = [f"任务队列（共 {len(_state.task_queue)} 个）："]
+            for index, task in enumerate(_state.task_queue, start=1):
+                lines.append(
+                    f"{index}. #{task.task_number} | {_project_label(task.project_path)} | {task.prompt[:60]}"
+                )
+            await query.edit_message_text("\n".join(lines))
     elif action == "new":
         if _state.mode == "running":
             await query.edit_message_text("当前任务仍在执行；结束后再新建会话。")
@@ -1172,8 +1402,19 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     async with _task_lock:
-        if _state.mode == "running":
-            await update.message.reply_text("当前任务还在执行。等它结束，或 /stop 后再发新任务。")
+        busy = _state.mode == "running" or (_current_task is not None and not _current_task.done())
+        if busy:
+            force_new = _state.start_new_session_next
+            _state.start_new_session_next = False
+            session_id = _state.choose_session_for_prompt(force_new)
+            queued = _state.enqueue_task(prompt, _state.current_cwd, session_id, force_new)
+            await update.message.reply_text(
+                f"⏳ 当前有任务在执行，已加入队列。\n"
+                f"队列位置：{len(_state.task_queue)} | 任务编号：#{queued.task_number}\n"
+                f"项目：{_state.current_project_label}\n"
+                f"内容：{prompt[:100]}\n"
+                "可用 /queue 查看，/queue clear 清空。"
+            )
             return
 
         pending = _state.pending
@@ -1227,6 +1468,7 @@ async def background_poll_loop():
 
 async def _post_init(app: Application):
     asyncio.create_task(background_poll_loop())
+    asyncio.create_task(_autosave_loop())
 
 
 # ---------------- 飞书适配入口 ----------------
@@ -1283,7 +1525,7 @@ async def dispatch_feishu_text(open_id: str, chat_id: str, text: str, transport)
         "/start": cmd_start, "/help": cmd_help, "/project": cmd_project,
         "/new": cmd_new, "/sessions": cmd_sessions, "/use": cmd_use,
         "/status": cmd_status, "/monitor": cmd_monitor, "/stop": cmd_stop,
-        "/health": cmd_health,
+        "/queue": cmd_queue, "/health": cmd_health,
     }
     handler = handlers.get(command.lower())
     if handler:
@@ -1335,6 +1577,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("monitor", cmd_monitor))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))

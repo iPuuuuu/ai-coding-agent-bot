@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -272,7 +273,14 @@ def run() -> None:
 
     async def serve() -> None:
         asyncio.create_task(bot.background_poll_loop())
-        await asyncio.to_thread(ws_client.start)
+        asyncio.create_task(bot._autosave_loop())
+        # Run the WebSocket client in a daemon thread so a Ctrl+C / SIGTERM
+        # can actually terminate the process instead of hanging on shutdown.
+        worker = threading.Thread(target=ws_client.start, daemon=True, name="feishu-ws")
+        worker.start()
+        while worker.is_alive():
+            await asyncio.sleep(1)
+        log.error("Feishu 长连接已退出，进程即将结束")
 
     log.info("Feishu bridge started; waiting for long-connection events")
     loop.run_until_complete(serve())

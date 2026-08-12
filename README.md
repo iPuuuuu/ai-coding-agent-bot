@@ -17,6 +17,8 @@
 - 支持接管**本机任意 Codex 会话**（包括在别处手动开的）
 - `/monitor` 只读监控本机 Codex + 旧 Claude 会话，状态变化主动提醒
 - 长任务每隔 `HEARTBEAT_SECONDS` 发一次心跳，完成/停止/出错都会通知
+- 任务忙时新消息自动**排队**（`/queue` 查看/清空），跑完一个自动接下一个
+- 托管会话与最近窗口记录自动持久化（`logs/state.json`），重启不丢
 - 桌面截图（mss）与网页截图（Playwright）能力，跑项目命令提示
 - 单实例保护：重复启动会被拒绝，不再出现多个 bot 抢同一个飞书长连接
 
@@ -41,7 +43,14 @@ scripts/restart.sh
 
 `scripts/run.sh` 会以 nohup 后台运行，日志写入 `logs/bot.log`（运行输出 `logs/bot.out.log`）。如果机器上还残留着旧的多实例，先执行一次 `scripts/stop_all.sh` 清理。
 
-开机自启（可选，macOS launchd）：在 `~/Library/LaunchAgents/com.ai-coding-agent-bot.plist` 里配置 `ProgramArguments` 为 `<项目路径>/scripts/run.sh`，`RunAtLoad` 设为 true 即可。
+开机自启 / 崩溃自动重启（macOS launchd，推荐）：
+
+```bash
+scripts/install_launchd.sh      # 注册并启动服务
+scripts/uninstall_launchd.sh    # 卸载服务
+```
+
+服务日志在 `logs/bot.out.log` / `logs/bot.err.log`；进程由 launchd 托管，完全脱离终端，重启电脑后自动拉起。
 
 ## 配置（.env）
 
@@ -57,6 +66,7 @@ scripts/restart.sh
 | `CODEX_MODEL` | 可选，强制指定 Codex 模型；留空用 `~/.codex/config.toml` |
 | `APPROVAL_TIMEOUT` / `APPROVAL_TIMEOUT_ACTION` | 等待选择超时与默认动作（`deny`/`allow`） |
 | `HEARTBEAT_SECONDS` | 长任务心跳间隔，0 关闭 |
+| `STATE_AUTOSAVE_SECONDS` | 会话/窗口记录自动保存间隔，0 关闭（默认 30s） |
 | `CODEX_SESSIONS_DIR` / `SESSION_MONITOR_DIR` | 本机会话监控目录，一般不用改 |
 
 完整字段见 `.env.example`。`.env` 已被 `.gitignore` 忽略，不会提交。
@@ -74,6 +84,7 @@ scripts/restart.sh
 | `/new` | 下一条消息强制新开会话 |
 | `/project` | 切换项目（支持简称或完整路径） |
 | `/stop` | 停止当前任务 |
+| `/queue` | 查看任务队列；`/queue clear` 清空队列 |
 | `/health` | 本机环境体检（Codex 可用性、监控目录、沙箱等） |
 
 ## 它是怎么工作的
@@ -92,6 +103,8 @@ scripts/restart.sh
 - 继续会话：`codex exec resume <session_id> --json <提示词>`（在项目目录内执行，通过信任目录检查；会话继承自己创建时的沙箱设置）
 - 解析 JSONL 事件流（`thread.started` / `item.completed` / `turn.completed`），只把 agent 的回复转发出去，不转发工具输入和敏感载荷
 - 检测到“问题 / 候选项”就进入等待状态，等你的回复或按钮选择
+- 任务执行中收到的新消息进入 FIFO 队列，当前任务结束自动执行下一个
+- 会话/项目面板/最近窗口每 30 秒保存到 `logs/state.json`，重启后自动恢复
 - 全局单会话执行模型：输出发往最近一次收到授权用户消息的会话；多群并行隔离暂未实现
 
 ## 安全边界

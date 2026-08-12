@@ -1,5 +1,6 @@
 """集中读取配置和风险规则。所有可调项都在这里。"""
 import os
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,7 +23,24 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Codex engine settings.  The sandbox restricts what the agent's generated
 # shell commands may touch; workspace-write allows file edits and tests inside
 # the project while keeping the rest of the machine read-only.
-CODEX_SANDBOX = os.getenv("CODEX_SANDBOX", "workspace-write").strip().lower()
+def _resolve_sandbox_mode() -> str:
+    """CODEX_SANDBOX may leak in from the ambient shell environment (e.g. a
+    parent Codex session sets it to an implementation name like "seatbelt").
+    Only the values the CLI accepts are meaningful; anything else falls back
+    to the safe default so the bot can still start.
+    """
+    value = os.getenv("CODEX_SANDBOX", "workspace-write").strip().lower()
+    if value in {"read-only", "workspace-write"}:
+        return value
+    if value:
+        print(
+            f"[config] 警告：CODEX_SANDBOX={value!r} 不是有效值，已回退为 workspace-write",
+            file=sys.stderr,
+        )
+    return "workspace-write"
+
+
+CODEX_SANDBOX = _resolve_sandbox_mode()
 CODEX_MODEL = os.getenv("CODEX_MODEL", "").strip()
 
 DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", "") or PROJECT_ROOT
@@ -57,6 +75,8 @@ APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT", "300"))
 APPROVAL_TIMEOUT_ACTION = os.getenv("APPROVAL_TIMEOUT_ACTION", "deny").lower()
 # Long-running task heartbeat interval in seconds; 0 disables the heartbeat.
 HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "300"))
+# Autosave interval for sessions/transcripts (seconds); 0 disables autosave.
+STATE_AUTOSAVE_SECONDS = float(os.getenv("STATE_AUTOSAVE_SECONDS", "30"))
 
 SESSION_MONITOR_DIR = os.getenv(
     "SESSION_MONITOR_DIR",
