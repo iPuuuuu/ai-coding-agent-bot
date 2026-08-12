@@ -9,7 +9,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-MONITOR_DIR = Path(os.getenv("CLAUDE_SESSION_MONITOR_DIR", "C:/Users/wmh/.claude/session-monitor"))
+MONITOR_DIR = Path(
+    os.getenv(
+        "CLAUDE_SESSION_MONITOR_DIR",
+        str(Path.home() / ".claude" / "session-monitor"),
+    )
+)
 EVENT_LOG = MONITOR_DIR / "events.jsonl"
 SNAPSHOT_FILE = MONITOR_DIR / "sessions.json"
 MAX_EVENTS = 200

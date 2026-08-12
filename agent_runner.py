@@ -1,8 +1,8 @@
 """
-agent_runner.py —— 封装一次 Claude Code CLI 对话回合。
+agent_runner.py —— 封装一次 Codex CLI 对话回合。
 
-bot 端现在显式托管 Claude session：
-- 只有明确创建时才新开 Claude 会话
+bot 端现在显式托管 Codex session：
+- 只有明确创建时才新开 Codex 会话
 - 后续继续对话时，始终 resume 到指定 session
 - 不再依赖“按 cwd 猜最近会话”的隐式行为
 """
@@ -18,13 +18,14 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import channel
+import config
 from permissions import build_supervisor_rules_text
 from tools.run_project import detect_run_hint
 from tools.screenshot import maybe_handle_visual_request
 
-SYSTEM_PROMPT = """你是一个常驻在用户家里 Windows 电脑上的编程监督助手，通过 Telegram 和用户沟通。
+SYSTEM_PROMPT = """你是一个常驻在用户电脑上的编程监督助手，通过 Telegram/飞书和用户沟通。
 原则：
-1. 你运行在 Claude Code CLI 中，可以读写代码、运行命令、修改项目。
+1. 你运行在 Codex CLI 中，可以读写代码、运行命令、修改项目。
 2. 用户只有手机 Telegram，所以你要主动汇报当前进度、下一步和阻塞点。
 3. 如果任务涉及高风险操作（例如安装依赖、联网下载、删除文件、git push），不要直接执行；先明确向用户提问，等待用户回复后再继续。
 4. 你的输出会被转发到 Telegram，尽量保持结构清楚。
@@ -78,43 +79,28 @@ def _reset_stop_flag():
 
 async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> TurnOutcome:
     """跑一回合；session_id 为空时新建会话，否则继续指定会话。"""
-    await _ensure_claude_available()
+    await _ensure_codex_available()
     _reset_stop_flag()
     if session_id:
         _clear_forwarded_reply(session_id)
 
     outcome = TurnOutcome(session_id=session_id or "")
     system_prompt = SYSTEM_PROMPT.format(rules=build_supervisor_rules_text())
-    command = _claude_command()
 
-    cmd = [
-        command,
-        "-p",
-        "--verbose",
-        "--output-format",
-        "stream-json",
-        "--input-format",
-        "text",
-        "--permission-mode",
-        "dontAsk",
-        "--append-system-prompt",
-        system_prompt,
-        prompt,
-    ]
-
-    if session_id:
-        cmd[1:1] = ["--resume", session_id]
+    effective_prompt = f"{system_prompt}\n\n当前用户任务：\n{prompt}"
+    cmd = build_codex_command(effective_prompt, cwd, session_id)
 
     global _active_process
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=cwd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
     except FileNotFoundError as exc:
-        raise AgentRunnerError(f"启动 Claude CLI 失败：找不到可执行文件 {command}") from exc
+        raise AgentRunnerError(f"启动 Codex CLI 失败：找不到可执行文件 {cmd[0]}") from exc
     _active_process = proc
 
     try:
@@ -133,7 +119,7 @@ async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> Turn
         if _stop_requested:
             raise asyncio.CancelledError()
         if rc != 0:
-            raise AgentRunnerError(outcome.final_text or f"Claude CLI 退出码 {rc}")
+            raise AgentRunnerError(outcome.final_text or f"Codex CLI 退出码 {rc}")
 
         await _maybe_send_visual_help(prompt, cwd)
         return outcome
@@ -141,8 +127,42 @@ async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> Turn
         _active_process = None
 
 
-async def _ensure_claude_available():
-    command = _claude_command()
+def build_codex_command(prompt: str, cwd: str, session_id: str | None = None) -> list[str]:
+    """Build the exact Codex CLI argv for one turn.
+
+    Verified against Codex CLI 0.147.0:
+
+    - New session:
+        codex exec --sandbox <mode> --json -C <cwd> --skip-git-repo-check <prompt>
+    - Resumed session (must run with cwd inside the project so the trusted
+      directory check passes; resume inherits the session's own sandbox):
+        codex exec resume <session_id> --json --skip-git-repo-check <prompt>
+
+    Older CLI versions accepted `--ask-for-approval never`; that flag no longer
+    exists and must not be passed.
+    """
+    command = _codex_command()
+    if session_id:
+        cmd = [command, "exec", "resume", session_id, "--json", "--skip-git-repo-check"]
+    else:
+        cmd = [
+            command,
+            "exec",
+            "--sandbox",
+            config.CODEX_SANDBOX,
+            "--json",
+            "-C",
+            cwd,
+            "--skip-git-repo-check",
+        ]
+    if config.CODEX_MODEL:
+        cmd += ["-m", config.CODEX_MODEL]
+    cmd.append(prompt)
+    return cmd
+
+
+async def _ensure_codex_available():
+    command = _codex_command()
     try:
         proc = await asyncio.create_subprocess_exec(
             command,
@@ -151,11 +171,11 @@ async def _ensure_claude_available():
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError as exc:
-        raise AgentRunnerError(f"本机 Claude CLI 不可用：找不到可执行文件 {command}") from exc
+        raise AgentRunnerError(f"本机 Codex CLI 不可用：找不到可执行文件 {command}") from exc
     out, err = await proc.communicate()
     if proc.returncode != 0:
         detail = (err or out).decode("utf-8", errors="replace").strip()
-        raise AgentRunnerError(f"本机 Claude CLI 不可用：{detail or f'无法执行 {command}'}")
+        raise AgentRunnerError(f"本机 Codex CLI 不可用：{detail or f'无法执行 {command}'}")
 
 
 async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
@@ -167,6 +187,44 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
         return False
 
     event_type = event.get("type")
+    # Codex `exec --json` emits typed thread/item/turn events rather than the
+    # Legacy Claude stream-json envelope (kept for old monitored sessions).
+    # Codex events are handled above. Keep only user-facing agent text and stable
+    # lifecycle markers; never forward tool input or sensitive payloads.
+    if event_type == "thread.started":
+        outcome.session_id = str(event.get("thread_id") or outcome.session_id)
+        outcome.events.append(MirrorEvent(kind="system/init", text=f"session={outcome.session_id}", session_id=outcome.session_id))
+        await channel.send_status(f"Codex 会话已建立：{outcome.session_id[:8]}")
+        return False
+    if event_type == "item.completed":
+        item = event.get("item") or {}
+        if item.get("type") in {"agent_message", "assistant_message"}:
+            text = str(item.get("text") or "").strip()
+            if text:
+                outcome.final_text = text
+                outcome.events.append(MirrorEvent(kind="assistant/text", text=text, session_id=outcome.session_id))
+                if _should_forward_reply(outcome.session_id, text):
+                    await channel.send_text(text)
+                options = _parse_options(text)
+                if options:
+                    outcome.waiting_text, outcome.choice_options = text, options
+                    return True
+                if _looks_like_question(text):
+                    outcome.waiting_text = text
+                    return True
+        return False
+    if event_type in {"turn.completed", "turn.failed", "error"}:
+        if event_type != "turn.completed":
+            detail = str(event.get("error") or event.get("message") or "Codex CLI 执行失败")
+            raise AgentRunnerError(detail)
+        return False
+    if event_type == "event_msg":
+        payload = event.get("payload") or {}
+        payload_type = payload.get("type")
+        if payload_type in {"task_started", "task_complete"}:
+            outcome.events.append(MirrorEvent(kind=f"system/{payload_type}", text=f"Codex：{payload_type}", session_id=outcome.session_id))
+            return False
+        return False
     if event_type == "system" and event.get("subtype") == "init":
         outcome.session_id = event.get("session_id", outcome.session_id)
         outcome.events.append(MirrorEvent(kind="system/init", text=f"session={outcome.session_id}", session_id=outcome.session_id))
@@ -218,7 +276,7 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
             else:
                 raise AgentRunnerError(result)
         elif subtype != "success":
-            raise AgentRunnerError("Claude CLI 执行失败")
+            raise AgentRunnerError("Codex CLI 执行失败")
         return False
 
     summary = _summarize_event(event)
@@ -302,7 +360,7 @@ def _summarize_event(event: dict) -> str:
         if subtype in {"init", "thinking_tokens"}:
             return ""
         if subtype == "thinking":
-            return "Claude 正在思考…"
+            return "Codex 正在思考…"
         if subtype:
             return f"系统事件：{subtype}"
     if event_type in {"assistant", "result", "user"}:
@@ -333,22 +391,5 @@ def _looks_like_question(text: str) -> bool:
     return any(word in low for word in ask_words)
 
 
-def _claude_command() -> str:
-    if os.name != "nt":
-        return shutil.which("claude") or "claude"
-
-    cmd_path = shutil.which("claude.cmd")
-    if cmd_path:
-        exe_path = os.path.join(
-            os.path.dirname(cmd_path),
-            "node_modules",
-            "@anthropic-ai",
-            "claude-code",
-            "bin",
-            "claude.exe",
-        )
-        if os.path.exists(exe_path):
-            return exe_path
-        return cmd_path
-
-    return "claude.cmd"
+def _codex_command() -> str:
+    return shutil.which("codex") or ("codex.cmd" if os.name == "nt" else "codex")

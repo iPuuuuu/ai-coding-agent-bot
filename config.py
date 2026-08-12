@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "0"))
 # `telegram` (the historical default) or `feishu`.  Feishu uses the official
@@ -15,12 +18,19 @@ FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 # intentionally different from a chat_id: an open_id identifies the sender.
 ALLOWED_FEISHU_OPEN_ID = os.getenv("ALLOWED_FEISHU_OPEN_ID", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", os.getcwd())
+
+# Codex engine settings.  The sandbox restricts what the agent's generated
+# shell commands may touch; workspace-write allows file edits and tests inside
+# the project while keeping the rest of the machine read-only.
+CODEX_SANDBOX = os.getenv("CODEX_SANDBOX", "workspace-write").strip().lower()
+CODEX_MODEL = os.getenv("CODEX_MODEL", "").strip()
+
+DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", "") or PROJECT_ROOT
 DEFAULT_PROJECTS = [
     path.strip()
     for path in os.getenv(
         "MONITORED_PROJECTS",
-        "C:/Users/wmh/Desktop/bot,C:/Users/wmh/Desktop/doctor-wang",
+        DEFAULT_PROJECT_DIR,
     ).split(",")
     if path.strip()
 ]
@@ -42,18 +52,22 @@ for root in PROJECTS_ROOTS:
             DEFAULT_PROJECTS.append(child)
 if DEFAULT_PROJECT_DIR not in DEFAULT_PROJECTS:
     DEFAULT_PROJECTS.insert(0, DEFAULT_PROJECT_DIR)
+
 APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT", "300"))
 APPROVAL_TIMEOUT_ACTION = os.getenv("APPROVAL_TIMEOUT_ACTION", "deny").lower()
+# Long-running task heartbeat interval in seconds; 0 disables the heartbeat.
+HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "300"))
+
 SESSION_MONITOR_DIR = os.getenv(
     "SESSION_MONITOR_DIR",
-    "C:/Users/wmh/.claude/session-monitor",
+    os.path.join(HOME, ".claude", "session-monitor"),
 )
 SESSION_EVENT_LOG = os.path.join(SESSION_MONITOR_DIR, "events.jsonl")
 SESSION_SNAPSHOT_FILE = os.path.join(SESSION_MONITOR_DIR, "sessions.json")
 GLOBAL_HOOK_SCRIPT = os.path.join(DEFAULT_PROJECT_DIR, "tools", "claude_session_hook.py")
 CODEX_SESSIONS_DIR = os.getenv(
     "CODEX_SESSIONS_DIR",
-    os.path.join(os.path.expanduser("~"), ".codex", "sessions"),
+    os.path.join(HOME, ".codex", "sessions"),
 )
 SESSION_MONITOR_POLL_SECONDS = float(os.getenv("SESSION_MONITOR_POLL_SECONDS", "5"))
 
@@ -93,6 +107,8 @@ def validate() -> list[str]:
             missing.append("FEISHU_APP_SECRET")
     else:
         missing.append("BOT_CHANNEL (telegram or feishu)")
+    if CODEX_SANDBOX not in {"read-only", "workspace-write"}:
+        missing.append("CODEX_SANDBOX (仅支持 read-only 或 workspace-write)")
     return missing
 
 

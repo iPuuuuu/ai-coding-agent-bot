@@ -1,270 +1,116 @@
 # AI Coding Agent 机器人
 
-让家里的 Windows 电脑常驻一个 **Claude Code 托管会话机器人**，你只用手机上的 **Telegram** 就能：
+让电脑常驻一个 **Codex 托管会话机器人**：你只用手机上的 Telegram / 飞书就能给电脑上的 Codex 下编程任务、看实时输出、点按钮继续会话，或者接管本机已经存在的 Codex 会话。
 
-- 给电脑上的 Claude 下编程任务
-- 尽量实时看到 Claude 在本机里的对话/状态输出
-- 查看 `bot` 和 `doctor-wang` 两个项目的最近窗口内容
-- 当 Claude 给出几个选项时，直接在手机上点按钮控制它继续
-- 在需要你补充信息时，直接用手机回复继续**同一个托管会话**
-- 明确控制“继续当前会话”还是“新开一个会话”
-
-> 这版实现的核心执行引擎是 **本机已安装的 Claude Code CLI (`claude`)**，不再依赖 `claude-agent-sdk` Python 包。
+> 执行引擎是本机安装的 **Codex CLI**（`codex`，当前版本 0.147.0）。
+> 旧的 Claude 会话只保留只读监控兼容。
 
 ---
 
-## 这版现在的目标
+## 功能
 
-这版不是“摘要机器人”，而是尽量接近：
+- 手机发消息 = 给当前项目下任务；已有会话则继续，没有则自动新建
+- Codex 回复**实时转发**到手机（自动去重，避免同一条输出刷屏）
+- Codex 给出 2–4 个候选项时自动转成**交互按钮**，点击后继续原会话
+- 需要你补充信息时直接转发问题，你回复一句就继续同一会话
+- `/new` 强制下一条消息新开会话；`/use <会话前8位>` 切换 / 接管会话
+- 支持接管**本机任意 Codex 会话**（包括在别处手动开的）
+- `/monitor` 只读监控本机 Codex + 旧 Claude 会话，状态变化主动提醒
+- 长任务每隔 `HEARTBEAT_SECONDS` 发一次心跳，完成/停止/出错都会通知
+- 桌面截图（mss）与网页截图（Playwright）能力，跑项目命令提示
+- 单实例保护：重复启动会被拒绝，不再出现多个 bot 抢同一个飞书长连接
 
-- **你在手机上看到的消息，接近电脑里 Claude Code 的窗口内容**
-- **Claude 给出选项时，你可以直接在手机上选**
-- **bot 自己托管 Claude 会话，不会为了读状态偷偷新开一个会话**
-
-当前实现重点是：
-
-1. **更完整地转发 Claude 输出**，不再只保留简短摘要。
-2. **保留会话最近窗口记录**，让 `/status` 能看到最近几条真实事件。
-3. **会话是显式托管的**：默认继续当前托管会话，只有你明确要求时才新开。
-4. **选项优先转成 Telegram 按钮**，点完后继续原来的 Claude 会话。
-
----
-
-## 依赖前提
-
-### 1）Claude Code CLI
-命令行里需要能运行：
+## 快速开始（macOS）
 
 ```bash
-claude --version
+cd ~/ai-coding-agent-bot
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m playwright install chromium
+cp .env.example .env   # 然后填写 .env
 ```
 
-### 2）Python 依赖
+启动 / 停止 / 重启 / 查看状态：
 
 ```bash
-cd C:/Users/wmh/Desktop/bot
-py -3.11 -m pip install -r requirements.txt
-py -3.11 -m playwright install chromium
+scripts/run.sh
+scripts/status.sh
+scripts/stop.sh
+scripts/restart.sh
 ```
 
----
+`scripts/run.sh` 会以 nohup 后台运行，日志写入 `logs/bot.log`（运行输出 `logs/bot.out.log`）。如果机器上还残留着旧的多实例，先执行一次 `scripts/stop_all.sh` 清理。
 
-## 配置 `.env`
+开机自启（可选，macOS launchd）：在 `~/Library/LaunchAgents/com.ai-coding-agent-bot.plist` 里配置 `ProgramArguments` 为 `<项目路径>/scripts/run.sh`，`RunAtLoad` 设为 true 即可。
 
-复制：
+## 配置（.env）
 
-```bash
-cp .env.example .env
-```
+| 变量 | 说明 |
+|---|---|
+| `BOT_CHANNEL` | `telegram` 或 `feishu`（推荐飞书，走长连接） |
+| `TELEGRAM_TOKEN` / `ALLOWED_CHAT_ID` | Telegram 通道必填 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `ALLOWED_FEISHU_OPEN_ID` | 飞书通道必填 |
+| `DEFAULT_PROJECT_DIR` | 默认工作目录 |
+| `MONITORED_PROJECTS` | 逗号分隔的监控/可切换项目 |
+| `PROJECTS_ROOTS` | 货架目录，一级子目录自动成为 `/project` 选项 |
+| `CODEX_SANDBOX` | `workspace-write`（推荐）或 `read-only` |
+| `CODEX_MODEL` | 可选，强制指定 Codex 模型；留空用 `~/.codex/config.toml` |
+| `APPROVAL_TIMEOUT` / `APPROVAL_TIMEOUT_ACTION` | 等待选择超时与默认动作（`deny`/`allow`） |
+| `HEARTBEAT_SECONDS` | 长任务心跳间隔，0 关闭 |
+| `CODEX_SESSIONS_DIR` / `SESSION_MONITOR_DIR` | 本机会话监控目录，一般不用改 |
 
-至少填写：
+完整字段见 `.env.example`。`.env` 已被 `.gitignore` 忽略，不会提交。
 
-- `TELEGRAM_TOKEN`
-- `ALLOWED_CHAT_ID`
-- `DEFAULT_PROJECT_DIR`
-- `MONITORED_PROJECTS`
+## 手机上的命令
 
-示例：
+| 命令 | 作用 |
+|---|---|
+| `/start` | 欢迎信息 + 快捷操作卡片 |
+| `/help` | 命令速览 |
+| `/status` | 当前项目/会话/任务状态 + 项目面板 + 监控总览 |
+| `/monitor` | 本机 Codex/Claude 会话总览；`/monitor all` 看全部；`/monitor codex:<id>` 看详情 |
+| `/sessions` | 托管会话列表 + 监控总览 |
+| `/use <前8位>` | 切换到托管会话，或接管本机已有的 Codex 会话 |
+| `/new` | 下一条消息强制新开会话 |
+| `/project` | 切换项目（支持简称或完整路径） |
+| `/stop` | 停止当前任务 |
+| `/health` | 本机环境体检（Codex 可用性、监控目录、沙箱等） |
 
-```env
-DEFAULT_PROJECT_DIR=C:/Users/wmh/Desktop/bot
-MONITORED_PROJECTS=C:/Users/wmh/Desktop/bot,C:/Users/wmh/Desktop/doctor-wang
-```
-
----
-
-## 启动
-
-```bash
-py -3.11 bot.py
-```
-
-然后在手机 Telegram 里给 bot 发：
+## 它是怎么工作的
 
 ```text
-/start
+手机(Telegram/飞书) ──► bot.py ──► codex exec --sandbox workspace-write --json -C <项目> <任务>
+        ▲                                   │
+        │◄────────── 实时输出 / 按钮 / 等待你回复
+        │                                   ▼
+        └───────────── 你的回复 ──► codex exec resume <session_id> --json
 ```
 
----
+关键点：
 
-## 手机上怎么用
+- 新会话：`codex exec --sandbox workspace-write --json -C <项目> <提示词>`
+- 继续会话：`codex exec resume <session_id> --json <提示词>`（在项目目录内执行，通过信任目录检查；会话继承自己创建时的沙箱设置）
+- 解析 JSONL 事件流（`thread.started` / `item.completed` / `turn.completed`），只把 agent 的回复转发出去，不转发工具输入和敏感载荷
+- 检测到“问题 / 候选项”就进入等待状态，等你的回复或按钮选择
+- 全局单会话执行模型：输出发往最近一次收到授权用户消息的会话；多群并行隔离暂未实现
 
-### 直接发任务
-直接发一句话，就是给**当前项目**下任务。
+## 安全边界
 
-如果当前项目已经有托管会话，这条消息会继续那个会话；如果还没有，就自动新建一个。
+- 白名单：只有 `ALLOWED_FEISHU_OPEN_ID` / `ALLOWED_CHAT_ID` 能指挥，其余一律拒绝
+- 沙箱：Codex 默认在 `workspace-write` 下运行，项目内可读写，项目外只读
+- 高风险操作（装依赖、删文件、push、联网等）由系统提示词要求 agent **先用自然语言问你**再动手；涉及沙箱外权限的命令仍会被沙箱拦截
+- 监控只读取会话元数据（ID/状态/最近活动），不读取、不转发 rollout 正文或密钥
+- 飞书日志只记录 open_id / chat_id / 事件类型，不再打印原始事件全文
 
-例如：
+## 排障
 
-```text
-查看当前进度
-```
+- **提示“已有 bot.py 实例在运行”**：执行 `scripts/stop_all.sh` 清理旧实例，再 `scripts/run.sh`
+- **任务报“Codex CLI 退出码”**：先 `codex --version` 确认 CLI 可用；再 `scripts/status.sh` 看日志 `logs/bot.out.log`
+- **需要联网/安装依赖被沙箱拦截**：这是 `workspace-write` 的预期行为；可让 agent 给出命令，你在本机终端执行，或自行调整沙箱策略（不推荐 `danger-full-access`）
+- **飞书收不到消息**：确认 `.env` 的 `ALLOWED_FEISHU_OPEN_ID` 与 `FEISHU_APP_ID/SECRET`，检查 `logs/bot.log` 是否有长连接错误
 
-```text
-修复测试失败
-```
+## 相关文档
 
-```text
-把项目跑起来截图给我看
-```
-
-### `/new`
-让**下一条**消息强制新开一个 Claude 会话。
-
-例如：
-
-```text
-/new
-```
-
-然后再发：
-
-```text
-重新从头审查这个项目架构
-```
-
-### `/sessions`
-查看当前 bot 托管的 Claude 会话列表。
-
-你会看到：
-
-- 会话短 ID
-- 所属项目
-- 当前状态
-- 会话标题（通常取第一条任务）
-
-### `/use <session_id前8位>`
-切换到某个已有托管会话。
-
-例如：
-
-```text
-/use ab12cd34
-```
-
-切过去以后，后续直接发文字就会继续这个会话。
-
-### `/status`
-会返回：
-
-- 当前操作项目
-- 当前选中的托管会话
-- 当前任务状态
-- 两个项目的最近状态
-- 当前项目最近几条“窗口内容”
-- 最近托管会话列表
-
-也就是说，它不只是摘要，还会给你看最近几条 Claude 会话镜像。
-
-### `/project`
-支持快速切换项目浏览上下文：
-
-```text
-/project bot
-```
-
-```text
-/project doctor-wang
-```
-
-也支持完整路径：
-
-```text
-/project C:/Users/wmh/Desktop/doctor-wang
-```
-
-如果这个项目之前已经有托管会话，切项目后会自动把当前会话焦点切到该项目最近一次会话。
-
-### `/stop`
-停止当前正在跑的任务。
-
----
-
-## 会话规则
-
-这版最重要的规则是：
-
-- **继续会话**：不会新开 Claude，会直接继续当前托管会话
-- **新会话**：只有你显式发送 `/new` 后，下一条消息才会开新会话
-- **按钮选择 / 文字补充**：都会回到触发该问题的原会话，不会串到别的项目或别的会话
-
-所以现在的语义已经从“每次发消息都像新跑一轮”改成了“bot 托管一组明确的 Claude 会话”。
-
----
-
-## 当 Claude 给出选项时
-
-如果 Claude 输出的是明确选项，比如：
-
-- 1. 先查日志
-- 2. 直接修配置
-- 3. 先跑测试
-
-机器人会尽量把它转成 **Telegram 按钮**。
-
-你在手机上点按钮后：
-
-- 这个选项会被当作你的回复
-- 继续发送给**原来的 Claude 会话**
-- 电脑上的 AI 会沿着那个选择继续跑
-
-如果某个问题没法稳定解析成按钮，机器人会退回成：
-
-- 把原问题转发给你
-- 让你直接发文字回复
-
----
-
-## 输出风格
-
-这版默认更偏向“窗口镜像”：
-
-- assistant 文本尽量原样转发
-- result 文本也会转发
-- 部分状态事件会简短显示
-- 不再强行压成很短的摘要
-
-所以你手机上看到的内容，会比上一版更长，但更接近电脑里的 Claude 窗口。
-
----
-
-## 当前限制
-
-- **同一时刻仍然只跑一个活跃任务**
-- 会保留两个项目的状态和最近窗口内容
-- 选项按钮优先处理 2~4 个清晰候选项
-- 太复杂的开放问题仍然要你手动文字回复
-- 当前托管会话列表是内存态，重启 bot 后不会自动恢复旧会话列表
-
----
-
-## 常见问题
-
-### 1）`claude` 命令不可用
-先检查：
-
-```bash
-claude --version
-```
-
-### 2）Telegram 没反应
-检查：
-
-- `py -3.11 bot.py` 是否还在运行
-- `.env` 的 `TELEGRAM_TOKEN` 是否正确
-- `ALLOWED_CHAT_ID` 是否正确
-
-### 3）为什么有时不是按钮，而是让我手动回复？
-因为不是所有 Claude 提问都能稳定解析成结构化选项。
-
-当前策略是：
-
-- **能稳定识别选项** → 发按钮
-- **识别不稳定** → 保留原文，让你直接文字回复
-
-### 4）为什么 `/status` 里能看到会话，但它不是你电脑上其他地方手动开的 Claude？
-因为这版采用的是 **bot 托管会话模型**：
-
-- bot 只能继续它自己创建并记录的 Claude 会话
-- 不会去“偷读”外部未知会话的实时状态
-- 这样才能保证手机上的继续/切换/按钮回复都准确绑定到同一个会话
+- [飞书接入说明](FEISHU.md)
+- [会话监控说明](MONITORING.md)
+- [开发计划与历史](DEVELOPMENT_PLAN.md)

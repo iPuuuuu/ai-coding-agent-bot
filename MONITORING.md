@@ -38,7 +38,7 @@
 `.env` 可选配置：
 
 ```env
-CODEX_SESSIONS_DIR=C:/Users/wmh/.codex/sessions
+CODEX_SESSIONS_DIR=/Users/a1234/.codex/sessions
 SESSION_MONITOR_POLL_SECONDS=5
 ```
 

@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -30,6 +31,7 @@ from telegram.ext import (
 import agent_runner
 import channel
 import config
+import single_instance
 from tools.codex_session_monitor import scan_sessions as scan_codex_sessions
 
 logging.basicConfig(
@@ -370,7 +372,7 @@ class RuntimeState:
             lines.append(self.projects[path].summary_line(is_active=(path == current_norm)))
         if self.sessions:
             lines.append(self.session_summary())
-        lines.append("全局 Claude 会话：")
+        lines.append("全局 Codex 会话：")
         lines.extend(_format_global_sessions())
         snap = self.ensure_project(self.current_cwd)
         if snap.transcript:
@@ -394,12 +396,25 @@ def _resolve_session_id(prefix: str) -> str:
     prefix = prefix.strip()
     if not prefix:
         return ""
+    source = ""
+    if ":" in prefix:
+        source, prefix = prefix.split(":", 1)
+        if source not in {"claude", "codex"}:
+            return ""
+        prefix = prefix.strip()
+    if not prefix:
+        return ""
     for session_id in _state.sessions:
-        if session_id.startswith(prefix):
+        if (not source or source == "codex") and session_id.startswith(prefix):
             return session_id
-    for session_id in _load_global_sessions():
-        if str(session_id).startswith(prefix):
-            return str(session_id)
+    if source in {"", "claude"}:
+        for session_id in _load_global_sessions():
+            if str(session_id).startswith(prefix):
+                return str(session_id)
+    if source in {"", "codex"}:
+        for session_id in _load_codex_sessions():
+            if str(session_id).startswith(prefix):
+                return str(session_id)
     return ""
 
 
@@ -419,7 +434,7 @@ def _load_global_sessions() -> dict[str, dict]:
 def _format_global_sessions(limit: int = 8) -> list[str]:
     sessions = _load_global_sessions()
     if not sessions:
-        return ["暂无全局 Claude 会话记录。"]
+        return ["暂无全局 Codex 会话记录。"]
     items = sorted(
         sessions.values(),
         key=lambda item: item.get("updated_at", 0),
@@ -580,16 +595,18 @@ def _format_monitored_session_detail(item: dict) -> str:
     if item.get("waiting_reason"):
         lines.append(f"等待原因：{str(item['waiting_reason'])[:400]}")
     if str(item.get("source")) == "claude":
-        lines.append("如需让本机器人继续该 Claude 会话，可使用 /use <会话前8位>。")
+        lines.append("Claude 会话为只读监控；如需继续，请回到原 Claude 终端操作。")
     else:
-        lines.append("Codex 会话为只读监控；请在原 Codex 终端或 Codex 客户端继续操作。")
+        lines.append("如需让本机器人继续该 Codex 会话，可使用 /use <会话前8位>。")
     return "\n".join(lines)
 
 
 def _format_waiting_message(session_id: str, item: dict) -> str:
+    source = str(item.get("source") or "codex")
+    source_label = "Codex" if source != "claude" else "Claude"
     cwd = _project_label(item.get("cwd", ""))
     notification_type = str(item.get("notification_type") or "").strip()
-    reason = str(item.get("waiting_reason") or item.get("last_text") or "Claude 正在等待你的输入").strip()
+    reason = str(item.get("waiting_reason") or item.get("last_text") or "Codex 正在等待你的输入").strip()
     low_reason = reason.lower()
     if (
         not reason
@@ -597,11 +614,11 @@ def _format_waiting_message(session_id: str, item: dict) -> str:
         or (reason.startswith("{") and '"session_id"' in reason and '"message"' in reason)
     ):
         if notification_type == "permission_prompt":
-            reason = "Claude 正在等待权限确认，请选择按钮或直接回复。"
+            reason = "Codex 正在等待权限确认，请选择按钮或直接回复。"
         else:
-            reason = "Claude 正在等待你的输入，但这次还没从 transcript 里提取到更具体的问题内容。"
+            reason = "Codex 正在等待你的输入，但这次还没从 transcript 里提取到更具体的问题内容。"
     return (
-        f"⚠️ Claude 会话需要你操作\n"
+        f"⚠️ {source_label} 会话需要你操作\n"
         f"会话：{session_id[:8]}\n"
         f"项目：{cwd}\n\n"
         f"{reason[:1200]}"
@@ -611,25 +628,37 @@ def _format_waiting_message(session_id: str, item: dict) -> str:
 def _adopt_global_session(session_id: str) -> ManagedSession | None:
     sessions = _load_global_sessions()
     item = sessions.get(session_id)
-    if not item:
-        return None
-    cwd = _norm_path(item.get("cwd", config.DEFAULT_PROJECT_DIR) or config.DEFAULT_PROJECT_DIR)
-    _state.ensure_project(cwd)
-    session = _state.bind_session(session_id, cwd)
-    session.title = str(item.get("last_text") or item.get("last_event") or session.title)[:48] or session.title
-    session.mode = "waiting_user_reply" if item.get("waiting") else item.get("status", "active")
-    session.last_event = str(item.get("last_event", session.last_event))
-    session.updated_at = float(item.get("updated_at", time.time()) or time.time())
-    if item.get("waiting"):
-        _state.pending = PendingInteraction(
-            project_path=cwd,
-            project_label=_project_label(cwd),
-            session_id=session_id,
-            prompt_text=str(item.get("waiting_reason") or item.get("last_text") or "Claude 正在等待你的回复"),
-            options=list(item.get("choice_options") or []),
-            source="buttons" if item.get("choice_options") else "text",
-        )
-    return session
+    if item:
+        cwd = _norm_path(item.get("cwd", config.DEFAULT_PROJECT_DIR) or config.DEFAULT_PROJECT_DIR)
+        _state.ensure_project(cwd)
+        session = _state.bind_session(session_id, cwd)
+        session.title = str(item.get("last_text") or item.get("last_event") or session.title)[:48] or session.title
+        session.mode = "waiting_user_reply" if item.get("waiting") else item.get("status", "active")
+        session.last_event = str(item.get("last_event", session.last_event))
+        session.updated_at = float(item.get("updated_at", time.time()) or time.time())
+        if item.get("waiting"):
+            _state.pending = PendingInteraction(
+                project_path=cwd,
+                project_label=_project_label(cwd),
+                session_id=session_id,
+                prompt_text=str(item.get("waiting_reason") or item.get("last_text") or "Codex 正在等待你的回复"),
+                options=list(item.get("choice_options") or []),
+                source="buttons" if item.get("choice_options") else "text",
+            )
+        return session
+
+    # Adopt a local Codex session (created by this bot or another Codex CLI).
+    codex_item = _load_codex_sessions().get(session_id)
+    if codex_item:
+        cwd = _norm_path(codex_item.get("cwd") or config.DEFAULT_PROJECT_DIR)
+        _state.ensure_project(cwd)
+        session = _state.bind_session(session_id, cwd)
+        session.title = str(codex_item.get("title") or codex_item.get("last_event") or session.title)[:48] or session.title
+        session.mode = str(codex_item.get("status", "unknown"))
+        session.last_event = str(codex_item.get("last_event") or session.last_event)
+        session.updated_at = float(codex_item.get("updated_at", time.time()) or time.time())
+        return session
+    return None
 
 
 _state = RuntimeState()
@@ -708,7 +737,7 @@ async def _poll_global_sessions(context: ContextTypes.DEFAULT_TYPE):
         reason = str(item.get("waiting_reason", "") or item.get("last_text", "")).strip()
         if not reason or not _remember_waiting_notice(session_id, reason):
             continue
-        message = _format_waiting_message(session_id, item)
+        message = _format_waiting_message(session_id, {**item, "source": "claude"})
         options = item.get("choice_options") or []
         if options:
             choice = await channel.ask_choice(message, options, timeout=config.APPROVAL_TIMEOUT)
@@ -738,7 +767,7 @@ async def _poll_external_session_status():
     for item in _load_global_sessions().values():
         status = "waiting" if item.get("waiting") else str(item.get("status", "unknown"))
         snapshots.append(("Claude", str(item.get("session_id", "")), {**item, "status": status}))
-    for item in await asyncio.to_thread(_load_codex_sessions):
+    for item in (await asyncio.to_thread(_load_codex_sessions)).values():
         snapshots.append(("Codex", str(item.get("session_id", "")), item))
 
     current: dict[str, str] = {}
@@ -766,6 +795,8 @@ async def _poll_external_session_status():
 async def _run_agent(prompt: str, project_path: str, session_id: str):
     global _current_task
     snap = _state.ensure_project(project_path)
+    started_at = time.time()
+    heartbeat = asyncio.create_task(_heartbeat_loop(snap, prompt, started_at))
     try:
         outcome = await agent_runner.run_turn(prompt, project_path, session_id=session_id or None)
         _state.append_events(project_path, outcome.events)
@@ -782,7 +813,7 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
                 project_path=project_path,
                 project_label=snap.label,
                 session_id=active_session_id,
-                prompt_text=outcome.waiting_text or "Claude 正在等待你的回复",
+                prompt_text=outcome.waiting_text or "Codex 正在等待你的回复",
                 options=outcome.choice_options,
                 source="buttons" if outcome.choice_options else "text",
             )
@@ -818,10 +849,11 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
         elif _state.stop_requested:
             _prune_managed_waiting_notice(active_session_id)
             _state.mark_done("任务已停止")
-            await channel.send_text(f"{snap.label} 已停止。")
+            await channel.send_text(f"⏹️ {snap.label} 已停止（用时 {int(time.time() - started_at)}s）。")
         else:
             _prune_managed_waiting_notice(active_session_id)
             _state.mark_done("任务完成")
+            await channel.send_text(f"✅ {snap.label} 任务完成（用时 {int(time.time() - started_at)}s）。")
     except asyncio.CancelledError:
         _prune_managed_waiting_notice(session_id)
         _state.mark_done("任务已取消")
@@ -833,8 +865,23 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
         _state.mark_error(f"Agent 运行出错：{type(e).__name__}: {e}")
         await channel.send_text(f"{snap.label} 出错：{type(e).__name__}: {e}")
     finally:
+        heartbeat.cancel()
         if _current_task is not None and _current_task.done():
             _current_task = None
+
+
+async def _heartbeat_loop(snap: ProjectSnapshot, prompt: str, started_at: float):
+    """Periodically report that a long task is still alive."""
+    interval = config.HEARTBEAT_SECONDS
+    if interval <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval)
+        elapsed = int(time.time() - started_at)
+        await channel.send_status(
+            f"⏳ {snap.label} 任务仍在执行… 已运行 {elapsed}s\n"
+            f"内容：{prompt[:80]}"
+        )
 
 
 # ---------------- 命令 ----------------
@@ -881,7 +928,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     _state.start_new_session_next = True
     await update.message.reply_text(
-        f"已标记：下一条发给 {_state.current_project_label} 的消息将新开 Claude 会话。"
+        f"已标记：下一条发给 {_state.current_project_label} 的消息将新开 Codex 会话。"
     )
 
 
@@ -926,8 +973,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_unauthorized(update)
         return
     await update.message.reply_text(
-        "Claude / Codex 会话机器人已上线。\n"
-        "下方卡片可直接查看状态、监控会话、切换项目或新建会话。"
+        "Codex 会话机器人已上线（旧 Claude 会话仅保留只读监控）。\n"
+        "下方卡片可直接查看状态、监控会话、切换项目或新建会话。\n"
+        "发送 /health 可检查本机环境；完整命令见 /help。"
     )
     await channel.send_command_menu()
 
@@ -938,9 +986,40 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "常用操作请直接点击下方卡片。\n"
-        "也可发送 /monitor、/status、/sessions、/project、/new、/stop。"
+        "也可发送 /monitor、/status、/sessions、/project、/new、/use、/stop、/health。"
     )
     await channel.send_command_menu()
+
+
+async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Cheap local environment check (no subprocess calls)."""
+    if not _authorized(update):
+        await _send_unauthorized(update)
+        return
+    mode = _state.mode
+    if mode == "running":
+        mode_text = f"忙碌（任务 #{_state.current_task_id}）"
+    elif mode == "waiting_user_reply":
+        mode_text = "等待你的回复"
+    else:
+        mode_text = "空闲"
+    codex_ok = "可用" if shutil.which("codex") else "未找到 codex 命令"
+    codex_dir_ok = "存在" if os.path.isdir(config.CODEX_SESSIONS_DIR) else "不存在"
+    claude_dir_ok = "存在" if os.path.isdir(config.SESSION_MONITOR_DIR) else "不存在"
+    lines = [
+        f"状态：{mode_text}",
+        f"通道：{config.BOT_CHANNEL}",
+        f"工作目录：{_state.current_cwd}",
+        f"Codex CLI：{codex_ok}",
+        f"Codex 会话目录：{codex_dir_ok}",
+        f"Claude 监控目录：{claude_dir_ok}",
+        f"沙箱：{config.CODEX_SANDBOX}",
+        f"项目数：{len(_state.projects)}",
+        f"心跳间隔：{config.HEARTBEAT_SECONDS}s",
+    ]
+    if config.CODEX_MODEL:
+        lines.append(f"Codex 模型：{config.CODEX_MODEL}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -992,7 +1071,7 @@ async def _handle_dashboard_action(action: str, query):
             await query.edit_message_text("当前任务仍在执行；结束后再新建会话。")
         else:
             _state.start_new_session_next = True
-            await query.edit_message_text("已标记：你下一条普通消息将创建一个新的 Claude 会话。")
+            await query.edit_message_text("已标记：你下一条普通消息将创建一个新的 Codex 会话。")
     elif action == "stop":
         if _state.mode == "idle" or _current_task is None:
             await query.edit_message_text("当前没有正在执行的机器人任务。")
@@ -1204,6 +1283,7 @@ async def dispatch_feishu_text(open_id: str, chat_id: str, text: str, transport)
         "/start": cmd_start, "/help": cmd_help, "/project": cmd_project,
         "/new": cmd_new, "/sessions": cmd_sessions, "/use": cmd_use,
         "/status": cmd_status, "/monitor": cmd_monitor, "/stop": cmd_stop,
+        "/health": cmd_health,
     }
     handler = handlers.get(command.lower())
     if handler:
@@ -1223,6 +1303,13 @@ async def dispatch_feishu_button(open_id: str, callback_data: str, transport):
 
 def main():
     os.makedirs("logs", exist_ok=True)
+    try:
+        guard = single_instance.acquire()
+    except single_instance.SingleInstanceError as exc:
+        raise SystemExit(str(exc)) from exc
+    import atexit
+
+    atexit.register(guard.release)
     missing = config.validate()
     if missing:
         raise SystemExit(config.format_missing_config(missing))
@@ -1248,6 +1335,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("monitor", cmd_monitor))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 

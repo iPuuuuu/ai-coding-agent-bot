@@ -222,16 +222,27 @@ def run() -> None:
     def on_message(data: Any) -> None:
         event = data.event
         message = event.message
+        open_id = getattr(getattr(event.sender, "sender_id", None), "open_id", "")
+        chat_id = getattr(message, "chat_id", "")
+        log.info(
+            "Feishu message event received: type=%s open_id=%s chat_id=%s",
+            getattr(message, "message_type", ""),
+            open_id or "-",
+            chat_id or "-",
+        )
         if message.message_type != "text":
+            log.info("Ignored non-text Feishu message: type=%s", message.message_type)
             return
         try:
             text = json.loads(message.content).get("text", "").strip()
         except (TypeError, json.JSONDecodeError):
+            log.warning("Failed to parse Feishu text content: %r", getattr(message, "content", None))
             return
-        open_id = event.sender.sender_id.open_id
+        log.info("Feishu text payload parsed: %r", text[:200])
         if open_id != config.ALLOWED_FEISHU_OPEN_ID:
             log.warning("Ignored Feishu message from open_id=%s", open_id)
-        schedule(bot.dispatch_feishu_text(open_id, message.chat_id, text, transport))
+            return
+        schedule(bot.dispatch_feishu_text(open_id, chat_id, text, transport))
 
     def on_card_action(data: Any) -> dict:
         event = data.event
@@ -239,13 +250,20 @@ def run() -> None:
         value = getattr(action, "value", {}) or {}
         callback_data = value.get("callback_data", "") if isinstance(value, dict) else ""
         open_id = event.operator.open_id
+        log.info(
+            "Feishu card action received: open_id=%s callback_data=%s",
+            open_id,
+            callback_data[:40],
+        )
         if open_id != config.ALLOWED_FEISHU_OPEN_ID:
             log.warning("Ignored Feishu card action from open_id=%s", open_id)
+            return
         schedule(bot.dispatch_feishu_button(open_id, callback_data, transport))
         return {"toast": {"type": "info", "content": "已收到，正在继续处理"}}
 
     handler = (
         lark.EventDispatcherHandler.builder("", "")
+        .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(lambda data: log.info("Feishu chat-enter event received"))
         .register_p2_im_message_receive_v1(on_message)
         .register_p2_card_action_trigger(on_card_action)
         .build()
