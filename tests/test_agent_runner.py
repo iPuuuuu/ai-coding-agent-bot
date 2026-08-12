@@ -168,6 +168,31 @@ class StreamNoiseTest(unittest.TestCase):
             channel.send_status = original
         self.assertEqual(sent, [])
 
+    def test_agent_text_not_forwarded_live_but_tracked(self):
+        sent: list[str] = []
+        original = channel.send_text
+
+        async def fake_send_text(text: str):
+            sent.append(text)
+
+        channel.send_text = fake_send_text
+        try:
+            async def run():
+                agent_runner._set_last_agent_text("")
+                outcome = agent_runner.TurnOutcome()
+                raw = (
+                    '{"type":"item.completed","item":{"id":"x","type":"agent_message",'
+                    '"text":"完成第一步，继续处理后续。"}}'
+                )
+                await agent_runner._handle_stream_line(raw, outcome)
+                return outcome
+            outcome = asyncio.run(run())
+        finally:
+            channel.send_text = original
+        self.assertEqual(sent, [])
+        self.assertEqual(outcome.final_text, "完成第一步，继续处理后续。")
+        self.assertEqual(agent_runner.last_agent_text(), "完成第一步，继续处理后续。")
+
 
 if __name__ == "__main__":
     unittest.main()

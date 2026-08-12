@@ -42,6 +42,7 @@ SYSTEM_PROMPT = """你是一个常驻在用户电脑上的编程监督助手，�
 _stop_requested = False
 _active_process: Optional[asyncio.subprocess.Process] = None
 _last_sent_reply_by_session: dict[str, str] = {}
+_last_agent_text = ""
 
 
 @dataclass
@@ -77,6 +78,17 @@ def request_stop():
 def _reset_stop_flag():
     global _stop_requested
     _stop_requested = False
+
+
+def last_agent_text() -> str:
+    """Latest agent output text, used by the heartbeat progress message."""
+    return _last_agent_text
+
+
+def _set_last_agent_text(text: str) -> None:
+    global _last_agent_text
+    if text:
+        _last_agent_text = text.strip()
 
 
 async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> TurnOutcome:
@@ -207,10 +219,9 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
         if item.get("type") in {"agent_message", "assistant_message"}:
             text = str(item.get("text") or "").strip()
             if text:
+                _set_last_agent_text(text)
                 outcome.final_text = text
                 outcome.events.append(MirrorEvent(kind="assistant/text", text=text, session_id=outcome.session_id))
-                if _should_forward_reply(outcome.session_id, text):
-                    await channel.send_text(text)
                 options = _parse_options(text)
                 if options:
                     outcome.waiting_text, outcome.choice_options = text, options
@@ -226,10 +237,6 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
         return False
     if event_type == "event_msg":
         payload = event.get("payload") or {}
-        payload_type = payload.get("type")
-        if payload_type in {"task_started", "task_complete"}:
-            outcome.events.append(MirrorEvent(kind=f"system/{payload_type}", text=f"Codex：{payload_type}", session_id=outcome.session_id))
-            return False
         return False
     if event_type == "system" and event.get("subtype") == "init":
         outcome.session_id = event.get("session_id", outcome.session_id)
@@ -242,9 +249,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
         session_id = event.get("session_id", outcome.session_id)
         text = _extract_text(message)
         if text:
+            _set_last_agent_text(text)
             outcome.events.append(MirrorEvent(kind="assistant/text", text=text, session_id=session_id))
-            if _should_forward_reply(session_id or outcome.session_id, text):
-                await channel.send_text(text)
             options = _parse_options(text)
             if options:
                 outcome.waiting_text = text
@@ -265,8 +271,6 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
             outcome.final_text = result
             outcome.events.append(MirrorEvent(kind=kind, text=result, session_id=session_id))
             if subtype == "success":
-                if _should_forward_reply(session_id, result):
-                    await channel.send_text(result)
                 options = _parse_options(result)
                 if options:
                     outcome.waiting_text = result
@@ -281,11 +285,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
             raise AgentRunnerError("Codex CLI 执行失败")
         return False
 
-    # Keep unrecognized events only in the local transcript; never forward
-    # internal event types (e.g. item.started) to the phone as noise.
-    summary = _summarize_event(event)
-    if summary:
-        outcome.events.append(MirrorEvent(kind=f"system/{event_type}", text=summary, session_id=outcome.session_id))
+    # Unrecognized internal events (item.started etc.) are ignored entirely:
+    # they are neither forwarded to the phone nor kept in the transcript.
     return False
 
 

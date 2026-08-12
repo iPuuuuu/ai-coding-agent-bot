@@ -74,7 +74,8 @@ if DEFAULT_PROJECT_DIR not in DEFAULT_PROJECTS:
 APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT", "300"))
 APPROVAL_TIMEOUT_ACTION = os.getenv("APPROVAL_TIMEOUT_ACTION", "deny").lower()
 # Long-running task heartbeat interval in seconds; 0 disables the heartbeat.
-HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "300"))
+# 120s keeps the phone feed readable: one short progress line every 2 minutes.
+HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "120"))
 # Autosave interval for sessions/transcripts (seconds); 0 disables autosave.
 STATE_AUTOSAVE_SECONDS = float(os.getenv("STATE_AUTOSAVE_SECONDS", "30"))
 

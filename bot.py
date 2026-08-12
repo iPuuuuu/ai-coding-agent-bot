@@ -434,6 +434,8 @@ class RuntimeState:
         if snap.transcript:
             lines.append("最近窗口：")
             for entry in snap.transcript[-6:]:
+                if entry.text.startswith("事件："):
+                    continue
                 label = entry.session_id[:8] if entry.session_id else "-"
                 lines.append(f"- [{entry.kind}/{label}] {entry.text[:100]}")
         return "\n".join(lines)
@@ -1010,6 +1012,9 @@ async def _poll_external_session_status():
     for source, session_id, item in snapshots:
         if not session_id:
             continue
+        if _session_is_managed(session_id):
+            # The bot reports its own tasks directly; do not double-push them.
+            continue
         key = f"{source}:{session_id}"
         status = str(item.get("status", "unknown"))
         current[key] = status
@@ -1082,6 +1087,8 @@ async def _run_agent(prompt: str, project_path: str, session_id: str):
         else:
             _prune_managed_waiting_notice(active_session_id)
             _state.mark_done("任务完成")
+            if outcome.final_text and outcome.final_text != outcome.waiting_text:
+                await channel.send_text(outcome.final_text)
             await channel.send_text(f"✅ {snap.label} 任务完成（用时 {int(time.time() - started_at)}s）。")
     except asyncio.CancelledError:
         _prune_managed_waiting_notice(session_id)
@@ -1106,10 +1113,13 @@ async def _heartbeat_loop(snap: ProjectSnapshot, prompt: str, started_at: float)
     while True:
         await asyncio.sleep(interval)
         elapsed = int(time.time() - started_at)
-        await channel.send_status(
-            f"⏳ {snap.label} 任务仍在执行… 已运行 {elapsed}s\n"
-            f"内容：{prompt[:80]}"
-        )
+        lines = [f"⏳ {snap.label} 任务 #{_state.current_task_id} 执行中… 已运行 {elapsed}s"]
+        latest = agent_runner.last_agent_text()
+        if latest:
+            lines.append(f"最近：{latest[:120]}")
+        else:
+            lines.append(f"任务：{prompt[:80]}")
+        await channel.send_status("\n".join(lines))
 
 
 async def _expire_waiting(pending: PendingInteraction, choice_id: str | None, timeout: int):
