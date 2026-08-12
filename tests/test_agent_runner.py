@@ -5,6 +5,7 @@ import asyncio
 import unittest
 
 import agent_runner
+import channel
 
 
 class BuildCommandTest(unittest.TestCase):
@@ -140,6 +141,32 @@ class HandleStreamLineTest(unittest.TestCase):
 
         with self.assertRaises(agent_runner.AgentRunnerError):
             asyncio.run(run())
+
+
+class StreamNoiseTest(unittest.TestCase):
+    """Internal Codex events must never be forwarded to the phone."""
+
+    def test_internal_events_not_forwarded(self):
+        sent: list[str] = []
+        original = channel.send_status
+
+        async def fake_send_status(text: str):
+            sent.append(text)
+
+        channel.send_status = fake_send_status
+        try:
+            async def run():
+                outcome = agent_runner.TurnOutcome()
+                for raw in (
+                    '{"type":"item.started"}',
+                    '{"type":"turn.started"}',
+                    '{"type":"item.completed","item":{"id":"x","type":"reasoning","summary":[],"content":[]}}',
+                ):
+                    await agent_runner._handle_stream_line(raw, outcome)
+            asyncio.run(run())
+        finally:
+            channel.send_status = original
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

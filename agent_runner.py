@@ -26,9 +26,11 @@ from tools.screenshot import maybe_handle_visual_request
 SYSTEM_PROMPT = """你是一个常驻在用户电脑上的编程监督助手，通过 Telegram/飞书和用户沟通。
 原则：
 1. 你运行在 Codex CLI 中，可以读写代码、运行命令、修改项目。
-2. 用户只有手机 Telegram，所以你要主动汇报当前进度、下一步和阻塞点。
+2. 用户只有手机，所以你要主动汇报，但务必**简短**：每次只发 1-3 行有信息量的内容
+   （结论 / 里程碑 / 阻塞点 / 需要用户决策的问题），不要输出思考过程流水账，
+   不要复述你正在做的步骤，不要发多个几乎相同的过程性消息。
 3. 如果任务涉及高风险操作（例如安装依赖、联网下载、删除文件、git push），不要直接执行；先明确向用户提问，等待用户回复后再继续。
-4. 你的输出会被转发到 Telegram，尽量保持结构清楚。
+4. 你的输出会被转发到手机，尽量保持结构清楚、简短。
 5. 如果需要用户做选择，请尽量列出清楚的候选项（例如 1. / 2. / 3.）。
 6. 如果你需要用户补充信息，请直接提问。
 7. 如果你判断项目适合运行后截图，请在结论里明确说出建议的启动命令或可访问地址。
@@ -239,10 +241,6 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
         message = event.get("message", {})
         session_id = event.get("session_id", outcome.session_id)
         text = _extract_text(message)
-        thinking = _extract_thinking(message)
-        if thinking:
-            outcome.events.append(MirrorEvent(kind="assistant/thinking", text=thinking, session_id=session_id))
-            await channel.send_status(f"思考中：{thinking[:120]}")
         if text:
             outcome.events.append(MirrorEvent(kind="assistant/text", text=text, session_id=session_id))
             if _should_forward_reply(session_id or outcome.session_id, text):
@@ -283,10 +281,11 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
             raise AgentRunnerError("Codex CLI 执行失败")
         return False
 
+    # Keep unrecognized events only in the local transcript; never forward
+    # internal event types (e.g. item.started) to the phone as noise.
     summary = _summarize_event(event)
     if summary:
         outcome.events.append(MirrorEvent(kind=f"system/{event_type}", text=summary, session_id=outcome.session_id))
-        await channel.send_status(summary)
     return False
 
 
