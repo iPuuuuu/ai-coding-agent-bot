@@ -39,10 +39,20 @@ SYSTEM_PROMPT = """你是一个常驻在用户电脑上的编程监督助手，�
 {rules}
 """
 
-_stop_requested = False
-_active_process: Optional[asyncio.subprocess.Process] = None
 _last_sent_reply_by_session: dict[str, str] = {}
-_last_agent_text = ""
+# Per-run latest agent text, keyed by the run_key handed to run_turn.  Kept
+# separate from _active_runs so heartbeat can read it after a run finished.
+_last_agent_texts: dict[str, str] = {}
+
+
+@dataclass
+class _RunControl:
+    """Mutable per-run state so several Codex processes can run in parallel."""
+    stop_requested: bool = False
+    process: Optional[asyncio.subprocess.Process] = None
+
+
+_active_runs: dict[str, _RunControl] = {}
 
 
 @dataclass
@@ -67,44 +77,60 @@ class AgentRunnerError(RuntimeError):
     pass
 
 
-def request_stop():
-    global _stop_requested
-    _stop_requested = True
-    proc = _active_process
-    if proc and proc.returncode is None:
-        proc.terminate()
+def request_stop(run_key: str | None = None):
+    """Request stopping one running Codex turn.
+
+    ``run_key`` matches the key passed to ``run_turn`` (normally the session id,
+    or a ``new:...`` key while a fresh session is still being created).  With no
+    argument, every active run is stopped (used by ``/stop all``).
+    """
+    if run_key is not None and run_key in _active_runs:
+        targets = [_active_runs[run_key]]
+    else:
+        targets = list(_active_runs.values())
+    for ctl in targets:
+        ctl.stop_requested = True
+        proc = ctl.process
+        if proc and proc.returncode is None:
+            proc.terminate()
 
 
-def _reset_stop_flag():
-    global _stop_requested
-    _stop_requested = False
+def last_agent_text(run_key: str = "") -> str:
+    """Latest agent output text of one run, used by the heartbeat progress."""
+    return _last_agent_texts.get(run_key, "")
 
 
-def last_agent_text() -> str:
-    """Latest agent output text, used by the heartbeat progress message."""
-    return _last_agent_text
-
-
-def _set_last_agent_text(text: str) -> None:
-    global _last_agent_text
+def _set_last_agent_text(text: str, run_key: str = "") -> None:
     if text:
-        _last_agent_text = text.strip()
+        _last_agent_texts[run_key] = text.strip()
 
 
-async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> TurnOutcome:
-    """跑一回合；session_id 为空时新建会话，否则继续指定会话。"""
+async def run_turn(
+    prompt: str,
+    cwd: str,
+    session_id: str | None = None,
+    run_key: str | None = None,
+    tag: str = "",
+) -> TurnOutcome:
+    """跑一回合；session_id 为空时新建会话，否则继续指定会话。
+
+    ``run_key`` 唯一标识这一次运行（并行场景下用于定向 stop / 心跳取文本，
+    通常就是 session_id，新建会话时为 ``new:...``）。
+    ``tag`` 为转发消息时的来源前缀（如 ``[会话 abc12345]``），并行时用于区分。
+    """
+    key = run_key or session_id or ""
     await _ensure_codex_available()
-    _reset_stop_flag()
     if session_id:
         _clear_forwarded_reply(session_id)
 
+    ctl = _RunControl()
+    _active_runs[key] = ctl
     outcome = TurnOutcome(session_id=session_id or "")
     system_prompt = SYSTEM_PROMPT.format(rules=build_supervisor_rules_text())
 
     effective_prompt = f"{system_prompt}\n\n当前用户任务：\n{prompt}"
     cmd = build_codex_command(effective_prompt, cwd, session_id)
 
-    global _active_process
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -115,22 +141,22 @@ async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> Turn
         )
     except FileNotFoundError as exc:
         raise AgentRunnerError(f"启动 Codex CLI 失败：找不到可执行文件 {cmd[0]}") from exc
-    _active_process = proc
+    ctl.process = proc
 
     try:
         assert proc.stdout is not None
         async for raw in proc.stdout:
-            if _stop_requested:
+            if ctl.stop_requested:
                 raise asyncio.CancelledError()
             line = raw.decode("utf-8", errors="replace").rstrip()
             if not line:
                 continue
-            waiting = await _handle_stream_line(line, outcome)
+            waiting = await _handle_stream_line(line, outcome, run_key=key, tag=tag)
             if waiting:
                 outcome.state = "waiting"
 
         rc = await proc.wait()
-        if _stop_requested:
+        if ctl.stop_requested:
             raise asyncio.CancelledError()
         if rc != 0:
             raise AgentRunnerError(outcome.final_text or f"Codex CLI 退出码 {rc}")
@@ -138,7 +164,12 @@ async def run_turn(prompt: str, cwd: str, session_id: str | None = None) -> Turn
         await _maybe_send_visual_help(prompt, cwd)
         return outcome
     finally:
-        _active_process = None
+        _active_runs.pop(key, None)
+        if proc.returncode is None:
+            try:
+                await proc.wait()
+            except Exception:
+                pass
 
 
 def build_codex_command(prompt: str, cwd: str, session_id: str | None = None) -> list[str]:
@@ -192,7 +223,7 @@ async def _ensure_codex_available():
         raise AgentRunnerError(f"本机 Codex CLI 不可用：{detail or f'无法执行 {command}'}")
 
 
-async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
+async def _handle_stream_line(line: str, outcome: TurnOutcome, run_key: str = "", tag: str = "") -> bool:
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
@@ -201,7 +232,7 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
         if line.strip() == "Reading additional input from stdin...":
             return False
         outcome.events.append(MirrorEvent(kind="raw/non_json", text=line, session_id=outcome.session_id))
-        await channel.send_text(line)
+        await channel.send_text(line, tag=tag)
         return False
 
     event_type = event.get("type")
@@ -212,14 +243,14 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
     if event_type == "thread.started":
         outcome.session_id = str(event.get("thread_id") or outcome.session_id)
         outcome.events.append(MirrorEvent(kind="system/init", text=f"session={outcome.session_id}", session_id=outcome.session_id))
-        await channel.send_status(f"Codex 会话已建立：{outcome.session_id[:8]}")
+        await channel.send_status(f"Codex 会话已建立：{outcome.session_id[:8]}", tag=tag)
         return False
     if event_type == "item.completed":
         item = event.get("item") or {}
         if item.get("type") in {"agent_message", "assistant_message"}:
             text = str(item.get("text") or "").strip()
             if text:
-                _set_last_agent_text(text)
+                _set_last_agent_text(text, run_key)
                 outcome.final_text = text
                 outcome.events.append(MirrorEvent(kind="assistant/text", text=text, session_id=outcome.session_id))
                 options = _parse_options(text)
@@ -241,7 +272,7 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
     if event_type == "system" and event.get("subtype") == "init":
         outcome.session_id = event.get("session_id", outcome.session_id)
         outcome.events.append(MirrorEvent(kind="system/init", text=f"session={outcome.session_id}", session_id=outcome.session_id))
-        await channel.send_status(f"会话已建立：{outcome.session_id[:8]}")
+        await channel.send_status(f"会话已建立：{outcome.session_id[:8]}", tag=tag)
         return False
 
     if event_type == "assistant":
@@ -249,7 +280,7 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome) -> bool:
         session_id = event.get("session_id", outcome.session_id)
         text = _extract_text(message)
         if text:
-            _set_last_agent_text(text)
+            _set_last_agent_text(text, run_key)
             outcome.events.append(MirrorEvent(kind="assistant/text", text=text, session_id=session_id))
             options = _parse_options(text)
             if options:

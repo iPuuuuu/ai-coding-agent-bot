@@ -37,11 +37,17 @@ def init_feishu(transport):
 
 # ---------------- 基础发送 ----------------
 
-async def send_text(text: str):
-    """发文字。Telegram 单条上限 4096 字符，自动分段。"""
+async def send_text(text: str, tag: str = ""):
+    """发文字。Telegram 单条上限 4096 字符，自动分段。
+
+    ``tag`` 是来源前缀（如 ``[会话 abc12345]``），多会话并行时用于区分
+    消息属于哪个会话；为空则不添加。
+    """
     if not text:
         return
     text = text.strip()
+    if tag:
+        text = f"{tag} {text}"
     if _feishu is not None:
         await _feishu.send_text(text)
         return
@@ -55,7 +61,7 @@ async def send_text(text: str):
             pass
 
 
-async def send_status(text: str, min_interval: float = 1.5):
+async def send_status(text: str, min_interval: float = 1.5, tag: str = ""):
     """发阶段性状态，做一点节流，避免工具消息刷屏。"""
     global _last_status_text, _last_status_at
     now = time.time()
@@ -63,7 +69,7 @@ async def send_status(text: str, min_interval: float = 1.5):
         return
     _last_status_text = text
     _last_status_at = now
-    await send_text(text)
+    await send_text(text, tag=tag)
 
 
 async def send_photo(path: str, caption: str = ""):
@@ -103,7 +109,7 @@ async def ask_choice(text: str, options: list[str], timeout: int) -> str | None:
         return None
 
 
-async def send_choice_no_wait(text: str, options: list[str]) -> str | None:
+async def send_choice_no_wait(text: str, options: list[str], title: str = "需要你的选择") -> str | None:
     """Send a choice card and return its id WITHOUT blocking for the answer.
 
     The button callback (``resolve_approval``) resolves the pending entry later;
@@ -116,7 +122,7 @@ async def send_choice_no_wait(text: str, options: list[str]) -> str | None:
     _pending[choice_id] = {"future": None, "options": options}
 
     if _feishu is not None:
-        await _feishu.send_choice(text, options, choice_id)
+        await _feishu.send_choice(text, options, choice_id, title=title)
     else:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         keyboard = InlineKeyboardMarkup(
@@ -219,3 +225,35 @@ async def send_project_choices(choices: list[tuple[str, str]]):
         [[InlineKeyboardButton(label[:48], callback_data=data)] for label, data in choices]
     )
     await _bot.send_message(chat_id=_chat_id, text="请选择要切换的项目：", reply_markup=keyboard)
+
+
+async def send_session_cards(heading: str, sessions: list[dict]):
+    """Send one interactive card per agent session with action buttons.
+
+    Each session dict::
+
+        {
+          "title": "Codex abc12345 · 运行中",
+          "subtitle": "doctor-wang | 最近事件…",
+          "buttons": [("焦点", "sess:focus:<id>"), ("停止", "sess:stop:<id>"), ...],
+        }
+
+    Used by ``/sessions`` so the phone can operate any session directly.
+    """
+    if not sessions or (not _bot and _feishu is None):
+        return
+    if _feishu is not None:
+        await _feishu.send_session_cards(heading, sessions)
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    for session in sessions:
+        title = str(session.get("title") or "会话")
+        subtitle = str(session.get("subtitle") or "")
+        buttons = [(str(label)[:32], str(data)) for label, data in (session.get("buttons") or [])]
+        text = f"{title}\n{subtitle}".strip()
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(label, callback_data=data)] for label, data in buttons]
+        ) if buttons else None
+        await _bot.send_message(chat_id=_chat_id, text=text[:3500], reply_markup=keyboard)
+    if heading:
+        await _bot.send_message(chat_id=_chat_id, text=heading[:3500])

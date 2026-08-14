@@ -54,13 +54,13 @@ class FeishuTransport:
             content = json.dumps({"text": text[start:start + 12_000]})
             await asyncio.to_thread(self._create_message, target, "text", content)
 
-    async def send_choice(self, text: str, options: list[str], choice_id: str) -> None:
+    async def send_choice(self, text: str, options: list[str], choice_id: str, title: str = "需要你的选择") -> None:
         target = self.chat_id
         if not target:
             return
         card = {
             "config": {"wide_screen_mode": True},
-            "header": {"title": {"tag": "plain_text", "content": "需要你的选择"}},
+            "header": {"title": {"tag": "plain_text", "content": title[:100]}},
             "elements": [
                 {"tag": "markdown", "content": text[:12_000]},
                 {
@@ -159,6 +159,41 @@ class FeishuTransport:
                 }],
             }
             await asyncio.to_thread(self._create_message, target, "interactive", json.dumps(card))
+
+    async def send_session_cards(self, heading: str, sessions: list[dict]) -> None:
+        """One interactive card per agent session with action buttons."""
+        target = self.chat_id
+        if not target or not sessions:
+            return
+        for session in sessions:
+            title = str(session.get("title") or "会话")[:100]
+            subtitle = str(session.get("subtitle") or "")
+            elements: list[dict] = []
+            if subtitle:
+                elements.append({"tag": "markdown", "content": subtitle[:8_000]})
+            buttons = session.get("buttons") or []
+            for offset in range(0, len(buttons), 2):
+                group = buttons[offset:offset + 2]
+                elements.append({
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": str(label)[:60]},
+                            "type": "primary" if offset == 0 and index == 0 else "default",
+                            "value": {"callback_data": str(callback_data)},
+                        }
+                        for index, (label, callback_data) in enumerate(group)
+                    ],
+                })
+            card = {
+                "config": {"wide_screen_mode": True},
+                "header": {"title": {"tag": "plain_text", "content": title}},
+                "elements": elements,
+            }
+            await asyncio.to_thread(self._create_message, target, "interactive", json.dumps(card))
+        if heading:
+            await self.send_text(heading)
 
     async def send_photo(self, path: str, caption: str = "") -> None:
         target = self.chat_id
@@ -311,7 +346,7 @@ def run() -> None:
     async def serve() -> None:
         asyncio.create_task(bot.background_poll_loop())
         asyncio.create_task(bot._autosave_loop())
-        asyncio.create_task(bot._drain_queue_if_idle())
+        asyncio.create_task(bot._drain_queues())
         # Run the WebSocket client in a daemon thread so a Ctrl+C / SIGTERM
         # can actually terminate the process instead of hanging on shutdown.
         # If the thread dies (network drop the SDK cannot recover from), keep

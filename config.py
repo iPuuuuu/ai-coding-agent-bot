@@ -73,6 +73,17 @@ if DEFAULT_PROJECT_DIR not in DEFAULT_PROJECTS:
 
 APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT", "300"))
 APPROVAL_TIMEOUT_ACTION = os.getenv("APPROVAL_TIMEOUT_ACTION", "deny").lower()
+# How many Codex sessions may run tasks at the same time.  Each session gets
+# its own `codex exec` subprocess; a value of 1 keeps the old serial behavior.
+def _resolve_parallel_limit() -> int:
+    try:
+        limit = int(os.getenv("MAX_PARALLEL_TASKS", "3"))
+    except ValueError:
+        limit = 3
+    return max(1, min(limit, 8))
+
+
+MAX_PARALLEL_TASKS = _resolve_parallel_limit()
 # Long-running task heartbeat interval in seconds; 0 disables the heartbeat.
 # 120s keeps the phone feed readable: one short progress line every 2 minutes.
 HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "120"))
