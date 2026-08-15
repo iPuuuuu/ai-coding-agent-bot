@@ -34,6 +34,7 @@ import agent_runner
 import channel
 import config
 import single_instance
+import web_dashboard
 from tools.codex_session_monitor import scan_sessions as scan_codex_sessions
 
 logging.basicConfig(
@@ -1219,6 +1220,8 @@ async def _poll_external_session_status():
         snapshots.append(("Claude", str(item.get("session_id", "")), {**item, "status": status}))
     for item in (await asyncio.to_thread(_load_codex_sessions)).values():
         snapshots.append(("Codex", str(item.get("session_id", "")), item))
+    # 供 Web 看板读取（避免看板自行触发远端 SSH 扫描）
+    web_dashboard.set_scan_cache([item for _, _, item in snapshots])
 
     current: dict[str, str] = {}
     for source, session_id, item in snapshots:
@@ -2015,6 +2018,7 @@ def main():
     missing = config.validate()
     if missing:
         raise SystemExit(config.format_missing_config(missing))
+    web_dashboard.start_dashboard()
     if not config.CODEX_REMOTE:
         # 远程模式下 DEFAULT_PROJECTS 是 Codex 机器（家里电脑）上的路径，
         # 不在云端 bot 所在机器创建。

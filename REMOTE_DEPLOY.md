@@ -67,7 +67,25 @@ ssh root@120.55.186.220 'ssh -p 2200 USER@localhost "codex --version"'
 # 4) 发 /sessions → 能看到家里电脑的 Codex 会话列表与操作卡片
 ```
 
-## 四、故障排查
+## 四、Web 看板（浏览器/手机查看会话状态）
+
+bot 内嵌一个只读看板（零第三方依赖），随 bot 启动：
+
+```env
+# /etc/ai-coding-agent-bot.env 追加：
+DASHBOARD_ENABLED=1
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=8080
+DASHBOARD_TOKEN=<一个随机长串，用于鉴权>
+```
+
+- 访问：`http://ECS_IP:8080/?token=<你的token>`（深色主题、手机自适应、5 秒自动刷新）
+- 页面展示：运行中/等待决策/队列统计、每个会话的状态卡片（项目/短ID/状态徽标/最后事件）、点击卡片看最近窗口
+- 数据来源：云端 bot 的会话缓存（经隧道远程扫描家里电脑的 `~/.codex/sessions`）
+- 安全：无 token 时看板只监听 `127.0.0.1`；配了 token 才对外监听，API 全部要求 `?token=` 或 `X-Dashboard-Token` 头
+- 提示：云服务器安全组需放行 `DASHBOARD_PORT`（如 8080）；不建议把 token 写进书签，可加在 URL 上（页面会记住到 localStorage）
+
+## 五、故障排查
 
 | 现象 | 处理 |
 |---|---|

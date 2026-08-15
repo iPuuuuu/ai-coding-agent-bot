@@ -116,6 +116,14 @@ CODEX_SESSIONS_DIR = os.getenv(
 )
 SESSION_MONITOR_POLL_SECONDS = float(os.getenv("SESSION_MONITOR_POLL_SECONDS", "5"))
 
+# ---- Web 看板（只读）----
+# 在浏览器/手机上查看家里电脑的会话状态。token 必填才会对外监听；
+# 不填 token 时仅绑定 127.0.0.1 防止裸奔。
+DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0").strip()
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8080"))
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "").strip()
+
 if ANTHROPIC_API_KEY:
     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
 
