@@ -130,6 +130,12 @@ scripts/uninstall_launchd.sh    # 卸载服务
 
 ## 相关文档
 
+- [远程架构部署（bot 常驻云端 ECS、codex 留在家里电脑）](REMOTE_DEPLOY.md)
 - [飞书接入说明](FEISHU.md)
 - [会话监控说明](MONITORING.md)
 - [开发计划与历史](DEVELOPMENT_PLAN.md)
+
+## 两种运行形态
+
+- **本地形态（默认）**：bot 与 Codex 在同一台机器（家里电脑）上跑，`scripts/run.sh` 或 launchd 常驻。
+- **远程形态**：bot 常驻云端 ECS（24/7 在线），Codex 留在家里电脑，两者经 SSH 反向隧道连接（`CODEX_REMOTE=1` + `CODEX_SSH_TARGET`）。你在外面随时指挥，家里电脑需开机且隧道在线。详见 [REMOTE_DEPLOY.md](REMOTE_DEPLOY.md)。
