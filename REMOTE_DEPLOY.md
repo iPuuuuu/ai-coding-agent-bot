@@ -93,7 +93,7 @@ DASHBOARD_TOKEN=<一个随机长串，用于鉴权>
 | 隧道反复掉线 | 检查 ECS 侧 `ss -tlnp | grep 2200` 是否监听 127.0.0.1:2200；Mac 侧 launchd KeepAlive 会自动重连 |
 | 任务超时无响应 | codex 执行 ssh 已带 ServerAliveInterval=30 心跳；若网络抖动导致中断，`/stop` 后重发任务 |
 
-## 五、安全说明
+## 六、安全说明
 
 - 隧道只绑云端 `127.0.0.1:2200`，不对公网开放；
 - 云端→家里的 SSH 用独立密钥（`/root/.ssh/id_ed25519`），只允许登录家里电脑；
