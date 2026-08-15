@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ai-coding-agent 反向隧道（在家里电脑上运行）：
+  把家里 Mac 的 sshd (22) 反代到云端服务器的 localhost:__PORT__，
+  云端的 bot 就能通过 `ssh -p __PORT__ __MAC_USER__@localhost` 遥控家里的 codex。
+  由 install_mac_tunnel.sh 生成占位符后安装到 ~/Library/LaunchAgents。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.a1234.ai-coding-agent-tunnel</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/ssh</string>
+        <string>-N</string>
+        <string>-R</string>
+        <string>127.0.0.1:__PORT__:localhost:22</string>
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <string>-o</string>
+        <string>ServerAliveInterval=30</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=3</string>
+        <string>-o</string>
+        <string>StrictHostKeyChecking=accept-new</string>
+        <string>-i</string>
+        <string>/Users/__MAC_USER__/.ssh/id_ed25519</string>
+        <string>root@__ECS_HOST__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/tunnel.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/tunnel.err.log</string>
+</dict>
+</plist>

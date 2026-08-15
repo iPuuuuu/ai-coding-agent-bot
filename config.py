@@ -43,6 +43,19 @@ def _resolve_sandbox_mode() -> str:
 CODEX_SANDBOX = _resolve_sandbox_mode()
 CODEX_MODEL = os.getenv("CODEX_MODEL", "").strip()
 
+# ---- 远程执行模式 ----
+# 场景：bot 常驻云端服务器（如阿里云 ECS，24/7 在线），而 Codex CLI 安装在
+# 家里的电脑上。此时设 CODEX_REMOTE=1，并把 CODEX_SSH_TARGET 指向能到达
+# Codex 机器的 ssh 目标（通常经反向隧道，如 "-p 2200 a1234@localhost"）。
+# Codex 命令会通过 ssh 在远端执行，会话监控也会改为远端扫描。
+CODEX_REMOTE = os.getenv("CODEX_REMOTE", "0").strip().lower() in {"1", "true", "yes", "on"}
+CODEX_SSH_TARGET = os.getenv("CODEX_SSH_TARGET", "").strip()
+CODEX_SSH_EXTRA_ARGS = os.getenv("CODEX_SSH_EXTRA_ARGS", "").strip()
+# 远端 ~/.codex/sessions 所在路径（默认远端 $HOME/.codex/sessions）
+CODEX_REMOTE_SESSIONS_DIR = os.getenv("CODEX_REMOTE_SESSIONS_DIR", "").strip()
+# 远端 codex 可执行文件路径（不填则按 PATH + 常见安装位置探测）
+CODEX_REMOTE_BIN = os.getenv("CODEX_REMOTE_BIN", "").strip()
+
 DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", "") or PROJECT_ROOT
 DEFAULT_PROJECTS = [
     path.strip()

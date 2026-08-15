@@ -1,0 +1,5 @@
+# Server-side dependencies only (bot bridge on the cloud; Codex stays at home).
+# mss/playwright are NOT needed on the server (screenshots are disabled in remote mode).
+python-telegram-bot>=21.0
+lark-oapi>=1.4.0
+python-dotenv>=1.0.0

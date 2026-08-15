@@ -695,6 +695,10 @@ def _resolve_session_id(prefix: str) -> str:
 
 
 def _load_global_sessions() -> dict[str, dict]:
+    # 远程模式下，旧 Claude hook 监控跑在 Codex 所在机器（家里电脑）上，
+    # 云端 bot 无法直接读取，统一置空（Codex 会话仍正常远程监控）。
+    if config.CODEX_REMOTE:
+        return {}
     path = config.SESSION_SNAPSHOT_FILE
     if not os.path.exists(path):
         return {}
@@ -728,8 +732,18 @@ def _format_global_sessions(limit: int = 8) -> list[str]:
 
 
 def _load_codex_sessions() -> dict[str, dict]:
-    """Read local Codex rollout metadata without exposing rollout contents."""
+    """Read local Codex rollout metadata without exposing rollout contents.
+
+    In remote mode (bot on a server, Codex on the home computer) the scan runs
+    over ssh on the machine that hosts the rollouts.
+    """
     try:
+        if config.CODEX_REMOTE:
+            return scan_codex_sessions.scan_sessions_remote(
+                sessions_dir=config.CODEX_REMOTE_SESSIONS_DIR,
+                ssh_target=config.CODEX_SSH_TARGET,
+                extra_args=config.CODEX_SSH_EXTRA_ARGS,
+            )
         return scan_codex_sessions(config.CODEX_SESSIONS_DIR)
     except Exception:
         log.exception("codex session scan failed")
@@ -1518,7 +1532,10 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         mode_text = "等待你的回复"
     else:
         mode_text = "空闲"
-    codex_ok = "可用" if shutil.which("codex") else "未找到 codex 命令"
+    if config.CODEX_REMOTE:
+        codex_ok = f"远端（{config.CODEX_SSH_TARGET}）"
+    else:
+        codex_ok = "可用" if shutil.which("codex") else "未找到 codex 命令"
     codex_dir_ok = "存在" if os.path.isdir(config.CODEX_SESSIONS_DIR) else "不存在"
     claude_dir_ok = "存在" if os.path.isdir(config.SESSION_MONITOR_DIR) else "不存在"
     lines = [
@@ -1998,8 +2015,11 @@ def main():
     missing = config.validate()
     if missing:
         raise SystemExit(config.format_missing_config(missing))
-    for path in config.DEFAULT_PROJECTS:
-        os.makedirs(path, exist_ok=True)
+    if not config.CODEX_REMOTE:
+        # 远程模式下 DEFAULT_PROJECTS 是 Codex 机器（家里电脑）上的路径，
+        # 不在云端 bot 所在机器创建。
+        for path in config.DEFAULT_PROJECTS:
+            os.makedirs(path, exist_ok=True)
 
     if config.BOT_CHANNEL == "feishu":
         from feishu_bridge import run as run_feishu

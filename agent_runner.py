@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -130,11 +131,15 @@ async def run_turn(
 
     effective_prompt = f"{system_prompt}\n\n当前用户任务：\n{prompt}"
     cmd = build_codex_command(effective_prompt, cwd, session_id)
+    local_cwd = cwd
+    if config.CODEX_REMOTE:
+        cmd = build_remote_command(cmd, cwd=cwd)
+        local_cwd = None  # remote shell does the cd
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            cwd=cwd,
+            cwd=local_cwd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -207,6 +212,26 @@ def build_codex_command(prompt: str, cwd: str, session_id: str | None = None) ->
 
 
 async def _ensure_codex_available():
+    if config.CODEX_REMOTE:
+        probe = (
+            f"{config.CODEX_REMOTE_BIN or 'codex'} --version"
+        )
+        cmd = _ssh_base_args() + [probe]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            raise AgentRunnerError(f"本机缺少 ssh 命令，无法远程执行：{cmd[0]}") from exc
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            detail = (err or out).decode("utf-8", errors="replace").strip()
+            raise AgentRunnerError(
+                f"远端 Codex 不可用（{config.CODEX_SSH_TARGET}）：{detail or '无法连接或找不到 codex'}"
+            )
+        return
     command = _codex_command()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -322,6 +347,9 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome, run_key: str = ""
 
 
 async def _maybe_send_visual_help(prompt: str, cwd: str):
+    if config.CODEX_REMOTE:
+        # 远程模式下本地目录不是 Codex 所在机器，跳过本地文件探测。
+        return
     if not any(word in prompt for word in ["截图", "跑起来", "运行", "效果", "网页"]):
         return
     hint = detect_run_hint(cwd)
@@ -428,3 +456,44 @@ def _looks_like_question(text: str) -> bool:
 
 def _codex_command() -> str:
     return shutil.which("codex") or ("codex.cmd" if os.name == "nt" else "codex")
+
+
+# ---------------- 远程执行（bot 在云端，codex 在家里电脑） ----------------
+
+def _ssh_base_args() -> list[str]:
+    """Base ssh argv used to reach the machine that hosts Codex."""
+    if not config.CODEX_REMOTE:
+        return []
+    args = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=20",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=6",
+    ]
+    if config.CODEX_SSH_EXTRA_ARGS:
+        args += shlex.split(config.CODEX_SSH_EXTRA_ARGS)
+    args += shlex.split(config.CODEX_SSH_TARGET)
+    return args
+
+
+def build_remote_command(codex_argv: list[str], cwd: str | None = None) -> list[str]:
+    """Wrap a local Codex argv into an ssh command that runs it on the remote.
+
+    The remote shell receives a single quoted command so multi-line prompts with
+    quotes/newlines survive the round trip; stdin stays DEVNULL on both ends.
+    """
+    parts: list[str] = []
+    if config.CODEX_REMOTE_BIN:
+        parts.append(
+            f"export PATH={shlex.quote(os.path.dirname(config.CODEX_REMOTE_BIN))}:$PATH"
+        )
+    else:
+        parts.append(
+            'export PATH="$HOME/.codex/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"'
+        )
+    if cwd:
+        parts.append(f"cd {shlex.quote(cwd)}")
+    parts.append(" ".join(shlex.quote(arg) for arg in codex_argv))
+    remote_script = " && ".join(parts)
+    return _ssh_base_args() + [remote_script]

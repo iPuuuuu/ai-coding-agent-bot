@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Coding Agent Bot (Feishu/Telegram bridge; Codex runs at home via reverse tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 代码目录（deploy_ecs.sh 默认 /srv/ai-coding-agent-bot，可改）
+WorkingDirectory=__PROJECT_DIR__
+# 密钥/配置放系统级 EnvironmentFile，不落在仓库目录里
+EnvironmentFile=/etc/ai-coding-agent-bot.env
+ExecStart=__PROJECT_DIR__/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target
