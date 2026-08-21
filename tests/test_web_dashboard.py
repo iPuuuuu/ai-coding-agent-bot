@@ -93,6 +93,23 @@ class DashboardPayloadTest(unittest.TestCase):
         self.assertIn("好的，已修复", texts)
         self.assertIsNone(web_dashboard._session_detail("不存在"))
 
+    def test_external_session_detail_and_running_count(self):
+        bot = self._import_bot()
+        bot._state.sessions.clear()
+        web_dashboard.set_scan_cache([{
+            "source": "claude", "session_id": "external-claude",
+            "cwd": "/tmp/claude", "status": "active",
+            "last_event": "UserPromptSubmit", "updated_at": 1000,
+            "activity_age_seconds": 2,
+        }])
+        payload = web_dashboard._overview_payload()
+        self.assertEqual(payload["parallel"]["running"], 1)
+        detail = web_dashboard._session_detail("external-claude")
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail["source"], "claude")
+        self.assertFalse(detail["controllable"])
+        web_dashboard.set_scan_cache([])
+
     def test_page_contains_core_elements(self):
         self.assertIn("api/overview", web_dashboard._PAGE)
         self.assertIn("api/session", web_dashboard._PAGE)

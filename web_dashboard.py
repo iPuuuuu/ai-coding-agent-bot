@@ -84,7 +84,8 @@ def _overview_payload() -> dict:
             "managed": sid in state.sessions,
             "focus": sid == state.current_session_id,
             "waiting": sid in bot._state.pending_by_session,
-            "last_prompt": (state.sessions[sid].last_prompt[:200] if sid in state.sessions else ""),
+            "controllable": str(item.get("source", "codex")) == "codex",
+            "last_prompt": (state.sessions[sid].last_prompt[:200] if sid in state.sessions else str(item.get("last_prompt", ""))[:200]),
         })
     for sid, managed in state.sessions.items():
         if sid in seen:
@@ -108,11 +109,19 @@ def _overview_payload() -> dict:
             "managed": True,
             "focus": sid == state.current_session_id,
             "waiting": sid in bot._state.pending_by_session,
+            "controllable": True,
             "last_prompt": managed.last_prompt[:200],
         })
-    records.sort(key=lambda r: (r["status"] in {"running", "waiting_user_reply", "active"}, r["focus"]),
-                 reverse=True)
+    records.sort(key=lambda r: (
+        r["status"] in {"running", "waiting_user_reply", "waiting", "active"},
+        r["focus"],
+        -int(r.get("activity_age_seconds", 0) or 0),
+    ), reverse=True)
 
+    external_running = sum(
+        1 for record in records
+        if record.get("status") in {"running", "active"}
+    )
     pending_list = [
         {
             "session_id": key,
@@ -136,7 +145,9 @@ def _overview_payload() -> dict:
         "current_project": state.current_project_label or bot._project_label(state.current_cwd),
         "current_session": (state.current_session_id or "")[:8],
         "parallel": {
-            "running": len(running_keys),
+            "running": max(len(running_keys), external_running),
+            "managed_running": len(running_keys),
+            "external_running": external_running,
             "limit": config.MAX_PARALLEL_TASKS,
             "queued": len(state.task_queue),
         },
@@ -154,28 +165,55 @@ def _session_detail(session_id: str) -> dict | None:
 
     state = bot._state
     managed = state.sessions.get(session_id)
-    if managed is None:
-        return None
-    project = state.projects.get(bot._norm_path(managed.project_path))
-    transcript = []
-    if project is not None:
-        transcript = [
-            {"kind": entry.kind, "text": entry.text[:500], "session": entry.session_id[:8], "at": entry.timestamp}
-            for entry in project.transcript[-40:]
-        ]
-    return {
-        "session_id": session_id,
-        "short_id": session_id[:8],
-        "project": managed.project_label,
-        "cwd": managed.project_path,
-        "title": managed.title,
-        "mode": managed.mode,
-        "last_event": managed.last_event,
-        "last_prompt": managed.last_prompt,
-        "created_at": managed.created_at,
-        "updated_at": managed.updated_at,
-        "transcript": transcript,
-    }
+    if managed is not None:
+        project = state.projects.get(bot._norm_path(managed.project_path))
+        transcript = []
+        if project is not None:
+            transcript = [
+                {"kind": entry.kind, "text": entry.text[:500], "session": entry.session_id[:8], "at": entry.timestamp}
+                for entry in project.transcript[-40:]
+            ]
+        return {
+            "session_id": session_id,
+            "short_id": session_id[:8],
+            "source": "codex",
+            "managed": True,
+            "controllable": True,
+            "project": managed.project_label,
+            "cwd": managed.project_path,
+            "title": managed.title,
+            "mode": managed.mode,
+            "last_event": managed.last_event,
+            "last_prompt": managed.last_prompt,
+            "created_at": managed.created_at,
+            "updated_at": managed.updated_at,
+            "transcript": transcript,
+        }
+
+    # External Claude/Codex records are intentionally metadata-only.  They
+    # still need a useful detail view instead of a misleading 404.
+    for record in get_scan_cache()[0]:
+        if str(record.get("session_id", "")) != session_id:
+            continue
+        source = str(record.get("source", "codex"))
+        return {
+            "session_id": session_id,
+            "short_id": session_id[:8],
+            "source": source,
+            "managed": False,
+            "controllable": source == "codex",
+            "project": bot._project_label(str(record.get("cwd", ""))),
+            "cwd": str(record.get("cwd", "")),
+            "title": str(record.get("title") or ("Claude 会话" if source == "claude" else "Codex 会话")),
+            "mode": str(record.get("status", "unknown")),
+            "last_event": str(record.get("last_event", "")),
+            "last_prompt": str(record.get("last_prompt", ""))[:500],
+            "created_at": record.get("created_at", 0),
+            "updated_at": record.get("updated_at", 0),
+            "transcript": [],
+            "read_only": source == "claude",
+        }
+    return None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -326,7 +364,7 @@ _PAGE = r"""<!doctype html>
 <div class="section">会话列表</div>
 <div id="sessions"></div>
 
-<footer>数据来自家里电脑的 Codex 会话 · 5 秒自动刷新</footer>
+<footer>数据来自本机 Claude / Codex 会话 · 外部会话为只读元数据 · 5 秒自动刷新</footer>
 
 <div class="overlay" id="overlay"><div class="panel" id="panel"></div></div>
 
@@ -379,9 +417,9 @@ async function refresh() {
         <span class="badge b-${esc(s.status)}">${esc(ST[s.status] || s.status)}</span>
         <span class="name">${esc(s.project)} / ${esc(s.short_id)}</span>
         ${s.focus ? '<span class="tag">焦点</span>' : ''}
-        ${s.managed ? '' : '<span class="tag">远端</span>'}
+        ${s.source === 'claude' ? '<span class="tag">Claude 只读</span>' : (s.managed ? '' : '<span class="tag">Codex 外部</span>')}
       </div>
-      <div class="sub">${esc(s.last_event || s.last_prompt || '—')}</div>
+      <div class="sub">${esc(s.last_event || s.last_prompt || '—')} · 最近 ${esc(s.activity_age_seconds)}s</div>
     </div>`).join('');
 }
 
@@ -396,7 +434,7 @@ async function openDetail(id) {
   panel.innerHTML = `
     <button class="close" onclick="document.getElementById('overlay').classList.remove('open')">✕ 关闭</button>
     <h2>${esc(d.project)} / ${esc(d.short_id)}</h2>
-    <div class="meta">${esc(d.session_id)}<br>标题：${esc(d.title)}<br>状态：${esc(ST[d.mode] || d.mode)}<br>最后事件：${esc(d.last_event)}<br>最后任务：${esc(d.last_prompt)}</div>
+    <div class="meta">来源：${esc(d.source)}${d.read_only ? '（只读）' : ''}<br>${esc(d.session_id)}<br>标题：${esc(d.title)}<br>状态：${esc(ST[d.mode] || d.mode)}<br>最后事件：${esc(d.last_event)}<br>最后任务：${esc(d.last_prompt)}<br>${d.controllable ? '可由 Bot 控制' : '请在原 Claude 终端操作'}</div>
     <div class="section">最近窗口</div>
     ${(d.transcript && d.transcript.length) ? d.transcript.map(m =>
       `<div class="msg ${esc(m.kind)}"><span class="k">[${esc(m.kind)}] ${esc(m.session)}</span>${esc(m.text)}</div>`).join('')

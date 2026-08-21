@@ -36,6 +36,7 @@ import config
 import single_instance
 import web_dashboard
 from tools.codex_session_monitor import scan_sessions as scan_codex_sessions
+from tools.claude_session_monitor import scan_sessions as scan_claude_transcripts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +72,8 @@ class PendingInteraction:
     prompt_text: str
     options: list[str] = field(default_factory=list)
     source: str = "text"  # text | buttons
+    engine: str = "codex"  # codex | claude
+    controllable: bool = True
 
 
 @dataclass
@@ -695,27 +698,55 @@ def _resolve_session_id(prefix: str) -> str:
     return ""
 
 
-def _load_global_sessions() -> dict[str, dict]:
-    # 远程模式下，旧 Claude hook 监控跑在 Codex 所在机器（家里电脑）上，
-    # 云端 bot 无法直接读取，统一置空（Codex 会话仍正常远程监控）。
-    if config.CODEX_REMOTE:
-        return {}
-    path = config.SESSION_SNAPSHOT_FILE
-    if not os.path.exists(path):
-        return {}
+def _claude_hook_registered() -> bool:
+    path = os.path.join(config.HOME, ".claude", "settings.json")
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except Exception:
-        return {}
-    sessions = data.get("sessions", {})
-    return sessions if isinstance(sessions, dict) else {}
+        return config.GLOBAL_HOOK_SCRIPT in json.dumps(data.get("hooks", {}), ensure_ascii=False)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _load_global_sessions() -> dict[str, dict]:
+    """Load Claude hook state and merge transcript-scan fallback records."""
+    sessions: dict[str, dict] = {}
+    if not config.CODEX_REMOTE:
+        path = config.SESSION_SNAPSHOT_FILE
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                snapshot = data.get("sessions", {})
+                if isinstance(snapshot, dict):
+                    sessions.update(snapshot)
+            except Exception:
+                log.warning("Claude hook snapshot unreadable; using transcript fallback", exc_info=True)
+        try:
+            fallback = scan_claude_transcripts(
+                config.CLAUDE_PROJECTS_DIR,
+                limit=config.CLAUDE_TRANSCRIPT_SCAN_LIMIT,
+            )
+        except Exception:
+            log.exception("Claude transcript scan failed")
+            fallback = {}
+        for session_id, record in fallback.items():
+            existing = sessions.get(session_id)
+            if existing:
+                merged = dict(record)
+                merged.update(existing)
+                merged["source"] = "claude"
+                merged["controllable"] = False
+                sessions[session_id] = merged
+            else:
+                sessions[session_id] = record
+    return sessions
 
 
 def _format_global_sessions(limit: int = 8) -> list[str]:
     sessions = _load_global_sessions()
     if not sessions:
-        return ["暂无全局 Codex 会话记录。"]
+        return ["暂无 Claude 会话记录。"]
     items = sorted(
         sessions.values(),
         key=lambda item: item.get("updated_at", 0),
@@ -793,6 +824,7 @@ def _collect_external_sessions() -> list[dict]:
         record = dict(item)
         record["source"] = "claude"
         record["status"] = "waiting" if item.get("waiting") else str(item.get("status", "unknown"))
+        record["controllable"] = False
         record["monitor_key"] = f"claude:{record.get('session_id', '')}"
         records.append(record)
     for item in _load_codex_sessions().values():
@@ -1197,16 +1229,11 @@ async def _poll_global_sessions(context: ContextTypes.DEFAULT_TYPE):
         message = _format_waiting_message(session_id, {**item, "source": "claude"})
         options = item.get("choice_options") or []
         if options:
-            adopted = _adopt_global_session(session_id)
-            if adopted is not None:
-                # _adopt_global_session sets the session pending; the button
-                # click (on_button) will resolve it and continue the session.
-                choice_id = await channel.send_choice_no_wait(message, options)
-                if choice_id is not None:
-                    _choice_session[choice_id] = session_id
-                    asyncio.create_task(
-                        _expire_waiting(_state.pending_by_session.get(session_id), choice_id, config.APPROVAL_TIMEOUT, session_id)
-                    )
+            # Claude is monitored read-only.  Never adopt it into the Codex
+            # runner: its session id belongs to a different engine.
+            await channel.send_text(
+                message + "\n\nClaude 会话当前仅支持只读监控，请在原 Claude 终端中选择或回复。"
+            )
         else:
             await channel.send_text(message)
 
@@ -1548,6 +1575,9 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Codex CLI：{codex_ok}",
         f"Codex 会话目录：{codex_dir_ok}",
         f"Claude 监控目录：{claude_dir_ok}",
+        f"Claude Hook：{'已注册' if _claude_hook_registered() else '未注册（已启用 transcript 扫描兜底）'}",
+        f"Claude transcript 目录：{'存在' if os.path.isdir(config.CLAUDE_PROJECTS_DIR) else '不存在'}",
+        f"Web 看板：{'已启用' if config.DASHBOARD_ENABLED else '未启用'}（{config.DASHBOARD_HOST}:{config.DASHBOARD_PORT}）",
         f"沙箱：{config.CODEX_SANDBOX}",
         f"项目数：{len(_state.projects)}",
         f"心跳间隔：{config.HEARTBEAT_SECONDS}s",

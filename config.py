@@ -115,6 +115,11 @@ CODEX_SESSIONS_DIR = os.getenv(
     os.path.join(HOME, ".codex", "sessions"),
 )
 SESSION_MONITOR_POLL_SECONDS = float(os.getenv("SESSION_MONITOR_POLL_SECONDS", "5"))
+CLAUDE_PROJECTS_DIR = os.getenv(
+    "CLAUDE_PROJECTS_DIR",
+    os.path.join(HOME, ".claude", "projects"),
+)
+CLAUDE_TRANSCRIPT_SCAN_LIMIT = int(os.getenv("CLAUDE_TRANSCRIPT_SCAN_LIMIT", "120"))
 
 # ---- Web 看板（只读）----
 # 在浏览器/手机上查看家里电脑的会话状态。token 必填才会对外监听；

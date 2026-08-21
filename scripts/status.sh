@@ -9,7 +9,7 @@ if [ ! -f logs/bot.pid ]; then
 fi
 PID="$(cat logs/bot.pid)"
 if kill -0 "$PID" 2>/dev/null; then
-  echo "bot: 运行中（PID $PID）"
+  echo "bot: 运行中（PID ${PID}）"
   ps -o pid,lstart,etime,command -p "$PID" | tail -n +2
 else
   echo "bot: 未在运行（pid 文件过期）"
