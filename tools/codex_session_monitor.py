@@ -1,8 +1,8 @@
 """Read-only discovery of local Codex CLI sessions.
 
 Codex stores every rollout as JSONL under ``~/.codex/sessions``.  This module
-only reads the metadata and event *types* needed for monitoring; it never
-copies prompts, model replies, tool input, or any secret from a rollout.
+reads metadata plus user-visible user/assistant messages. It never copies
+reasoning, tool input/output, commands, or other internal payloads.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from typing import Any
 
 DEFAULT_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 ACTIVE_GRACE_SECONDS = 180
+MESSAGE_LIMIT = 24
 
 
 def _as_timestamp(value: Any, fallback: float) -> float:
@@ -28,6 +29,36 @@ def _as_timestamp(value: Any, fallback: float) -> float:
         except ValueError:
             pass
     return fallback
+
+
+def _completed_message(item: dict[str, Any], timestamp: float) -> dict[str, Any] | None:
+    """Extract only the user-visible text from a completed conversation item."""
+    item_type = str(item.get("type") or "")
+    role = {"UserMessage": "user", "AgentMessage": "assistant"}.get(item_type)
+    if not role:
+        return None
+    parts: list[str] = []
+    content = item.get("content")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type") or "").lower() not in {"text", "input_text", "output_text"}:
+                continue
+            text = str(block.get("text") or "").strip()
+            if text:
+                parts.append(text)
+    text = "\n\n".join(parts).strip()
+    if not text:
+        return None
+    return {
+        "id": str(item.get("id") or f"{role}:{timestamp}:{text[:40]}"),
+        "role": role,
+        "text": text,
+        "timestamp": timestamp,
+    }
 
 
 def _read_rollout(path: Path) -> dict[str, Any] | None:
@@ -45,6 +76,7 @@ def _read_rollout(path: Path) -> dict[str, Any] | None:
     last_event = ""
     last_event_at = modified_at
     last_task_event = ""
+    messages: list[dict[str, Any]] = []
 
     for raw in lines:
         try:
@@ -66,6 +98,10 @@ def _read_rollout(path: Path) -> dict[str, Any] | None:
             last_event_at = timestamp
             if event_type in {"task_started", "task_complete", "turn_aborted"}:
                 last_task_event = event_type
+            if event_type == "item_completed" and isinstance(payload.get("item"), dict):
+                message = _completed_message(payload["item"], timestamp)
+                if message:
+                    messages.append(message)
 
     if not session_id:
         # The filename ends in the thread id on supported Codex versions.
@@ -94,6 +130,7 @@ def _read_rollout(path: Path) -> dict[str, Any] | None:
         "last_event_at": last_event_at,
         "activity_age_seconds": int(age),
         "rollout_path": str(path),
+        "messages": messages[-MESSAGE_LIMIT:],
     }
 
 
@@ -144,6 +181,30 @@ def _ts(value, fallback):
             pass
     return fallback
 
+def _message(item, timestamp):
+    item_type = str(item.get("type") or "")
+    role = {"UserMessage": "user", "AgentMessage": "assistant"}.get(item_type)
+    if not role:
+        return None
+    parts = []
+    content = item.get("content")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type") or "").lower() not in {"text", "input_text", "output_text"}:
+                continue
+            text = str(block.get("text") or "").strip()
+            if text:
+                parts.append(text)
+    text = "\n\n".join(parts).strip()
+    if not text:
+        return None
+    return {"id": str(item.get("id") or f"{role}:{timestamp}:{text[:40]}"),
+            "role": role, "text": text, "timestamp": timestamp}
+
 rows = []
 if root.exists():
     try:
@@ -160,6 +221,7 @@ if root.exists():
         session_id, cwd, title = "", "", ""
         created_at = mtime
         last_event, last_event_at, last_task = "", mtime, ""
+        messages = []
         for raw in lines:
             try:
                 item = json.loads(raw)
@@ -178,6 +240,10 @@ if root.exists():
                 last_event_at = ts
                 if event_type in {"task_started", "task_complete", "turn_aborted"}:
                     last_task = event_type
+                if event_type == "item_completed" and isinstance(payload.get("item"), dict):
+                    message = _message(payload["item"], ts)
+                    if message:
+                        messages.append(message)
         if not session_id:
             session_id = path.stem.rsplit("-", 5)[-1] if path.stem else path.name
         now = time.time()
@@ -195,6 +261,7 @@ if root.exists():
             "created_at": created_at, "updated_at": mtime, "status": status,
             "last_event": last_event or "unknown", "last_event_at": last_event_at,
             "activity_age_seconds": int(age), "rollout_path": str(path),
+            "messages": messages[-24:],
         })
 for row in rows:
     print(json.dumps(row, ensure_ascii=False))

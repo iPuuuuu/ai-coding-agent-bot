@@ -168,12 +168,12 @@ class StreamNoiseTest(unittest.TestCase):
             channel.send_status = original
         self.assertEqual(sent, [])
 
-    def test_agent_text_not_forwarded_live_but_tracked(self):
+    def test_agent_text_forwarded_live_and_tracked(self):
         sent: list[str] = []
         original = channel.send_text
 
-        async def fake_send_text(text: str):
-            sent.append(text)
+        async def fake_send_text(text: str, tag: str = ""):
+            sent.append(f"{tag} {text}".strip())
 
         channel.send_text = fake_send_text
         try:
@@ -189,9 +189,32 @@ class StreamNoiseTest(unittest.TestCase):
             outcome = asyncio.run(run())
         finally:
             channel.send_text = original
-        self.assertEqual(sent, [])
+        self.assertEqual(sent, ["完成第一步，继续处理后续。"])
         self.assertEqual(outcome.final_text, "完成第一步，继续处理后续。")
         self.assertEqual(agent_runner.last_agent_text(), "完成第一步，继续处理后续。")
+
+    def test_question_is_deferred_to_interactive_card(self):
+        sent: list[str] = []
+        original = channel.send_text
+
+        async def fake_send_text(text: str, tag: str = ""):
+            sent.append(text)
+
+        channel.send_text = fake_send_text
+        try:
+            async def run():
+                outcome = agent_runner.TurnOutcome(session_id="sess-q")
+                waiting = await agent_runner._handle_stream_line(
+                    '{"type":"item.completed","item":{"type":"agent_message","text":"请选择：\\n1. A\\n2. B"}}',
+                    outcome,
+                )
+                return waiting, outcome
+            waiting, outcome = asyncio.run(run())
+        finally:
+            channel.send_text = original
+        self.assertTrue(waiting)
+        self.assertEqual(sent, [])
+        self.assertEqual(outcome.choice_options, ["A", "B"])
 
 
 if __name__ == "__main__":

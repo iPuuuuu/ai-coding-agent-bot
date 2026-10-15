@@ -1004,6 +1004,7 @@ _active_runs_by_project: dict[str, int] = {}
 _seen_global_event_offset = 0
 _last_waiting_notice: dict[str, str] = {}
 _external_session_states: dict[str, str] = {}
+_external_message_cursors: dict[str, str] = {}
 _external_session_monitor_ready = False
 
 
@@ -1251,16 +1252,45 @@ async def _poll_external_session_status():
     web_dashboard.set_scan_cache([item for _, _, item in snapshots])
 
     current: dict[str, str] = {}
+    current_message_cursors: dict[str, str] = {}
+    owned_session_ids = agent_runner.active_session_ids()
     for source, session_id, item in snapshots:
         if not session_id:
-            continue
-        if _session_is_managed(session_id):
-            # The bot reports its own tasks directly; do not double-push them.
             continue
         key = f"{source}:{session_id}"
         status = str(item.get("status", "unknown"))
         current[key] = status
+        messages = item.get("messages") if source == "Codex" else []
+        if isinstance(messages, list) and messages:
+            message_ids = [str(message.get("id") or "") for message in messages if isinstance(message, dict)]
+            previous_message_id = _external_message_cursors.get(key, "")
+            start = len(messages)
+            if session_id in owned_session_ids or not _external_session_monitor_ready:
+                # Seed/advance the cursor without sending. The runner forwards
+                # its own live output and startup must never replay history.
+                start = len(messages)
+            elif previous_message_id and previous_message_id in message_ids:
+                start = message_ids.index(previous_message_id) + 1
+            else:
+                start = max(0, len(messages) - 6)
+            for message in messages[start:]:
+                if isinstance(message, dict):
+                    await _forward_external_codex_message(session_id, item, message)
+            current_message_cursors[key] = message_ids[-1] if message_ids else ""
         previous = _external_session_states.get(key)
+        if (source == "Codex" and previous in {"running", "active"}
+                and status not in {"running", "active"} and isinstance(messages, list)):
+            last_assistant = next(
+                (message for message in reversed(messages)
+                 if isinstance(message, dict) and message.get("role") == "assistant"),
+                None,
+            )
+            if (last_assistant is not None
+                    and str(last_assistant.get("id") or "") == previous_message_id):
+                await _forward_external_codex_message(session_id, item, last_assistant)
+        if _session_is_managed(session_id) or session_id in owned_session_ids:
+            # The bot reports lifecycle changes for its own sessions directly.
+            continue
         if not _external_session_monitor_ready or previous == status:
             continue
         project = _project_label(str(item.get("cwd", ""))) if item.get("cwd") else "-"
@@ -1272,7 +1302,65 @@ async def _poll_external_session_status():
         )
     _external_session_states.clear()
     _external_session_states.update(current)
+    _external_message_cursors.clear()
+    _external_message_cursors.update(current_message_cursors)
     _external_session_monitor_ready = True
+
+
+async def _forward_external_codex_message(session_id: str, item: dict, message: dict) -> None:
+    """Mirror one new external Codex conversation message to the phone."""
+    text = str(message.get("text") or "").strip()
+    role = str(message.get("role") or "")
+    if not text or role not in {"user", "assistant"}:
+        return
+    tag = f"[Codex {session_id[:8]}]"
+    if role == "user":
+        await channel.send_text(f"你：{text}", tag=tag)
+        return
+
+    options = agent_runner._parse_options(text)
+    needs_reply = bool(options or agent_runner._looks_like_question(text))
+    if not needs_reply:
+        await channel.send_text(text, tag=tag)
+        return
+    if str(item.get("status") or "") == "running":
+        await channel.send_text(
+            text + "\n\n该会话仍在原 Codex 终端运行；内容已同步，待本轮结束后可从 bot 接管继续。",
+            tag=tag,
+        )
+        return
+    if not _remember_waiting_notice(session_id, text):
+        return
+    session = _adopt_global_session(session_id)
+    if session is None:
+        await channel.send_text(text + "\n\n该会话需要回复，但目前无法远程接管。", tag=tag)
+        return
+    pending = PendingInteraction(
+        project_path=session.project_path,
+        project_label=session.project_label,
+        session_id=session_id,
+        prompt_text=text,
+        options=options,
+        source="buttons" if options else "text",
+    )
+    _state.mark_waiting(pending)
+    waiting_message = _format_waiting_message(session_id, {
+        "cwd": session.project_path,
+        "waiting_reason": text,
+        "last_text": text,
+        "source": "codex",
+    })
+    if options:
+        choice_id = await channel.send_choice_no_wait(
+            waiting_message,
+            options,
+            title=f"Codex {session_id[:8]} 需要你的选择",
+        )
+        if choice_id is not None:
+            _choice_session[choice_id] = session_id
+            asyncio.create_task(_expire_waiting(pending, choice_id, config.APPROVAL_TIMEOUT, session_id))
+    else:
+        await channel.send_text(waiting_message, tag=tag)
 
 
 async def _run_agent(prompt: str, project_path: str, session_key: str, session_id: str):
@@ -1346,7 +1434,8 @@ async def _run_agent(prompt: str, project_path: str, session_key: str, session_i
         else:
             _prune_managed_waiting_notice(active_session_id)
             _state.mark_done("任务完成")
-            if outcome.final_text and outcome.final_text != outcome.waiting_text:
+            if (outcome.final_text and outcome.final_text != outcome.waiting_text
+                    and agent_runner._should_forward_reply(active_session_id or session_key, outcome.final_text)):
                 await channel.send_text(outcome.final_text, tag=tag)
             await channel.send_text(f"✅ {snap.label} 任务完成（用时 {int(time.time() - started_at)}s）。", tag=tag)
     except asyncio.CancelledError:

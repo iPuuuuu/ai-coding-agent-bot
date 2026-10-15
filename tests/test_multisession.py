@@ -205,6 +205,35 @@ class SessionCardsTest(unittest.TestCase):
         self.assertNotIn("停止", labels)  # not running
 
 
+class ExternalMessageForwardTest(unittest.TestCase):
+    def setUp(self):
+        self._pending = dict(bot._state.pending_by_session)
+        bot._state.pending_by_session.clear()
+        bot._last_waiting_notice.clear()
+
+    def tearDown(self):
+        bot._state.pending_by_session.clear()
+        bot._state.pending_by_session.update(self._pending)
+        bot._last_waiting_notice.clear()
+
+    def test_running_external_question_is_not_adopted(self):
+        sent: list[str] = []
+
+        async def fake_send(text, tag=""):
+            sent.append(text)
+
+        with mock.patch.object(bot.channel, "send_text", side_effect=fake_send), \
+             mock.patch.object(bot, "_adopt_global_session") as adopt:
+            asyncio.run(bot._forward_external_codex_message(
+                "sess-running",
+                {"status": "running", "cwd": "/tmp/p"},
+                {"role": "assistant", "text": "你希望用 A 还是 B？"},
+            ))
+
+        adopt.assert_not_called()
+        self.assertIn("仍在原 Codex 终端运行", sent[0])
+
+
 class RunLifecycleTest(unittest.TestCase):
     """End-to-end scheduling: _start_run -> _run_agent -> outcome handling."""
 

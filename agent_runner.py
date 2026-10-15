@@ -54,6 +54,7 @@ class _RunControl:
 
 
 _active_runs: dict[str, _RunControl] = {}
+_active_session_ids: dict[str, str] = {}
 
 
 @dataclass
@@ -99,6 +100,11 @@ def request_stop(run_key: str | None = None):
 def last_agent_text(run_key: str = "") -> str:
     """Latest agent output text of one run, used by the heartbeat progress."""
     return _last_agent_texts.get(run_key, "")
+
+
+def active_session_ids() -> set[str]:
+    """Codex thread ids currently owned by this runner."""
+    return {session_id for session_id in _active_session_ids.values() if session_id}
 
 
 def _set_last_agent_text(text: str, run_key: str = "") -> None:
@@ -170,6 +176,7 @@ async def run_turn(
         return outcome
     finally:
         _active_runs.pop(key, None)
+        _active_session_ids.pop(key, None)
         if proc.returncode is None:
             try:
                 await proc.wait()
@@ -267,6 +274,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome, run_key: str = ""
     # lifecycle markers; never forward tool input or sensitive payloads.
     if event_type == "thread.started":
         outcome.session_id = str(event.get("thread_id") or outcome.session_id)
+        if outcome.session_id:
+            _active_session_ids[run_key or outcome.session_id] = outcome.session_id
         outcome.events.append(MirrorEvent(kind="system/init", text=f"session={outcome.session_id}", session_id=outcome.session_id))
         await channel.send_status(f"Codex 会话已建立：{outcome.session_id[:8]}", tag=tag)
         return False
@@ -285,6 +294,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome, run_key: str = ""
                 if _looks_like_question(text):
                     outcome.waiting_text = text
                     return True
+                if _should_forward_reply(outcome.session_id or run_key, text):
+                    await channel.send_text(text, tag=tag)
         return False
     if event_type in {"turn.completed", "turn.failed", "error"}:
         if event_type != "turn.completed":
@@ -315,6 +326,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome, run_key: str = ""
             if _looks_like_question(text):
                 outcome.waiting_text = text
                 return True
+            if _should_forward_reply(session_id or run_key, text):
+                await channel.send_text(text, tag=tag)
         return False
 
     if event_type == "result":
@@ -335,6 +348,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome, run_key: str = ""
                 if _looks_like_question(result):
                     outcome.waiting_text = result
                     return True
+                if _should_forward_reply(session_id or run_key, result):
+                    await channel.send_text(result, tag=tag)
             else:
                 raise AgentRunnerError(result)
         elif subtype != "success":
