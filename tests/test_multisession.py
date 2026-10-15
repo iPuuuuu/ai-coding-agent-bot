@@ -198,11 +198,28 @@ class SessionCardsTest(unittest.TestCase):
         card = cards[0]
         self.assertIn("codex-11", card["title"])
         self.assertIn("已完成", card["title"])
+        self.assertIn("工作区：`/tmp/proj`", card["subtitle"])
         labels = [label for label, _ in card["buttons"]]
         self.assertIn("详情", labels)
         self.assertIn("焦点", labels)
         self.assertIn("接管", labels)
         self.assertNotIn("停止", labels)  # not running
+
+
+class WorkspacePickerTest(unittest.TestCase):
+    def test_workspace_index_resolves_configured_path(self):
+        choices = bot._workspace_choices("new")
+        self.assertTrue(choices)
+        _, callback = choices[0]
+        self.assertTrue(callback.startswith("workspace:new:"))
+        self.assertEqual(
+            bot._resolve_workspace_index(callback.rsplit(":", 1)[1]),
+            next(iter(bot._state.projects.values())).path,
+        )
+
+    def test_invalid_workspace_index_is_rejected(self):
+        self.assertEqual(bot._resolve_workspace_index("bad"), "")
+        self.assertEqual(bot._resolve_workspace_index("999999"), "")
 
 
 class ExternalMessageForwardTest(unittest.TestCase):

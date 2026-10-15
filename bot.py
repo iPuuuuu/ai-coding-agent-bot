@@ -435,6 +435,7 @@ class RuntimeState:
             lines.append(
                 f"{marker} {session.short_id} | {session.project_label} | {session.mode} | {session.title[:28]}"
             )
+            lines.append(f"  工作区：{session.project_path}")
         lines.append("用 /use <session_id前8位> 切换；/new 让下一条消息强制开新会话。")
         return "\n".join(lines)
 
@@ -839,8 +840,8 @@ def _format_monitor_row(item: dict) -> str:
     source = str(item.get("source", "?")).title()
     session_id = str(item.get("session_id", ""))[:8] or "-"
     status = _session_status_label(str(item.get("status", "unknown")))
-    project = _project_label(str(item.get("cwd", ""))) if item.get("cwd") else "-"
-    return f"[{source}] {session_id} | {status} | {project}"
+    workspace = str(item.get("cwd", "")) or "-"
+    return f"[{source}] {session_id} | {status} | 工作区：{workspace}"
 
 
 def _format_session_overview() -> str:
@@ -911,7 +912,7 @@ def _format_monitored_session_detail(item: dict) -> str:
         f"{source} 会话详情",
         f"会话：{session_id}",
         f"状态：{_session_status_label(str(item.get('status', 'unknown')))}",
-        f"项目：{project}",
+        f"工作区：{project}",
         f"最后事件：{event[:160]}",
         f"最后活动：{age}s 前",
     ]
@@ -1144,6 +1145,34 @@ def _find_session_record(session_id: str) -> dict | None:
     return None
 
 
+def _workspace_choices(action: str) -> list[tuple[str, str]]:
+    """Build compact, unambiguous workspace callbacks for phone cards."""
+    return [
+        (f"{snap.label} · {snap.path}", f"workspace:{action}:{index}")
+        for index, snap in enumerate(_state.projects.values())
+    ]
+
+
+def _resolve_workspace_index(raw_index: str) -> str:
+    try:
+        index = int(raw_index)
+    except ValueError:
+        return ""
+    paths = [snap.path for snap in _state.projects.values()]
+    return paths[index] if 0 <= index < len(paths) else ""
+
+
+async def _send_new_session_workspace_picker(reply) -> None:
+    await reply(
+        f"新建 Codex 会话\n当前工作区：{_state.current_cwd}\n请选择新会话所在的工作区。"
+    )
+    await channel.send_project_choices(
+        _workspace_choices("new"),
+        title="选择新会话工作区",
+        prompt="请选择新会话所在的工作区：",
+    )
+
+
 def _build_session_cards() -> list[dict]:
     """Build one interactive card per visible session for ``/sessions``."""
     cards: list[dict] = []
@@ -1158,7 +1187,8 @@ def _build_session_cards() -> list[dict]:
             continue
         status = str(item.get("status", "unknown"))
         status_label = _session_status_label(status)
-        project = _project_label(str(item.get("cwd", ""))) if item.get("cwd") else "-"
+        workspace = str(item.get("cwd", "")) or "-"
+        project = _project_label(workspace) if workspace != "-" else "-"
         event = str(item.get("last_event", ""))[:40] or "-"
         managed = session_id in _state.sessions
         is_focus = session_id == _state.current_session_id
@@ -1167,7 +1197,7 @@ def _build_session_cards() -> list[dict]:
         waiting = status in {"waiting", "waiting_user_reply"} or session_id in _state.pending_by_session
         icon = "👉" if is_focus else ("🟢" if running else ("🟡" if waiting else "•"))
         title = f"{icon} {source.title()} {session_id[:8]} · {status_label}"
-        subtitle = f"{project} | {event}"
+        subtitle = f"工作区：`{workspace}`\n{project} | {event}"
         if managed:
             subtitle += " | 托管"
         buttons: list[tuple[str, str]] = [("详情", f"sess:detail:{session_id}")]
@@ -1562,10 +1592,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         await _send_unauthorized(update)
         return
-    _state.start_new_session_next = True
-    await update.message.reply_text(
-        f"已标记：下一条发给 {_state.current_project_label} 的消息将新开 Codex 会话。"
-    )
+    await _send_new_session_workspace_picker(update.message.reply_text)
 
 
 async def cmd_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1596,7 +1623,7 @@ async def cmd_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _state.current_session_id = session_id
     _state.start_new_session_next = False
     await update.message.reply_text(
-        f"已设为焦点会话：{session.short_id}\n项目：{session.project_label}\n标题：{session.title}\n"
+        f"已设为焦点会话：{session.short_id}\n工作区：{session.project_path}\n标题：{session.title}\n"
         "直接发消息即可继续该会话；也可用「@会话前8位 消息」指定任意会话。"
     )
 
@@ -1775,9 +1802,8 @@ async def _handle_dashboard_action(action: str, query):
                 "点击按钮可查看详情 / 设为焦点 / 停止 / 接管对应会话：", cards
             )
     elif action == "project":
-        choices = [(snap.label, f"project:{snap.label}") for snap in _state.projects.values()]
-        await query.edit_message_text(f"当前项目：{_state.current_project_label}\n请选择要切换的项目：")
-        await channel.send_project_choices(choices)
+        await query.edit_message_text(f"当前工作区：{_state.current_cwd}\n请选择要切换的工作区：")
+        await channel.send_project_choices(_workspace_choices("switch"), title="切换工作区")
     elif action == "queue":
         if not _state.task_queue:
             await query.edit_message_text("队列为空，当前没有排队中的任务。")
@@ -1790,8 +1816,7 @@ async def _handle_dashboard_action(action: str, query):
                 )
             await query.edit_message_text("\n".join(lines))
     elif action == "new":
-        _state.start_new_session_next = True
-        await query.edit_message_text("已标记：你下一条消息将为目标会话新建 Codex 会话。")
+        await _send_new_session_workspace_picker(query.edit_message_text)
     elif action == "stop":
         if _stop_session_run(_state.current_session_id):
             await query.edit_message_text(f"已请求停止：{_state.current_project_label}")
@@ -1816,16 +1841,50 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("sess:"):
         await _handle_session_action(query)
         return
+    if query.data.startswith("workspace:"):
+        try:
+            _, action, raw_index = query.data.split(":", 2)
+        except ValueError:
+            await query.edit_message_text("工作区按钮数据无效。请重新打开快捷面板。")
+            return
+        target = _resolve_workspace_index(raw_index)
+        if not target:
+            await query.edit_message_text("该工作区已不在列表中。请重新打开快捷面板。")
+            return
+        _state.set_current_project(target)
+        if action == "new":
+            _state.current_session_id = ""
+            _state.start_new_session_next = True
+            await query.edit_message_text(
+                f"已选择新会话工作区：{_state.current_project_label}\n"
+                f"路径：{_state.current_cwd}\n\n直接发送任务内容，将在此工作区新建 Codex 会话。"
+            )
+            return
+        if action != "switch":
+            await query.edit_message_text("未知的工作区操作。请重新打开快捷面板。")
+            return
+        _state.start_new_session_next = False
+        session = _state.get_current_session()
+        session_label = session.short_id if session else "无"
+        await query.edit_message_text(
+            f"已切换工作区：{_state.current_project_label}\n"
+            f"路径：{_state.current_cwd}\n当前会话：{session_label}"
+        )
+        return
     if query.data.startswith("project:"):
+        # Keep old cards usable after deploying this callback format.
         label = query.data.split(":", 1)[1].strip().lower()
         target = next((snap.path for snap in _state.projects.values() if snap.label.lower() == label), "")
         if not target:
-            await query.edit_message_text("该项目已不在可切换列表中。请重新发送 /start。")
+            await query.edit_message_text("该工作区已不在列表中。请重新打开快捷面板。")
             return
         _state.set_current_project(target)
         session = _state.get_current_session()
         session_label = session.short_id if session else "无"
-        await query.edit_message_text(f"已切换到：{_state.current_project_label}\n当前会话：{session_label}")
+        await query.edit_message_text(
+            f"已切换工作区：{_state.current_project_label}\n"
+            f"路径：{_state.current_cwd}\n当前会话：{session_label}"
+        )
         return
     if query.data.startswith("monitor:"):
         try:
@@ -1894,6 +1953,7 @@ async def _handle_session_action(query):
         _state.start_new_session_next = False
         await query.edit_message_text(
             f"已设为焦点会话：{session.short_id} | {session.project_label}\n"
+            f"工作区：{session.project_path}\n"
             "直接发消息即可继续该会话。"
         )
         return
@@ -1919,7 +1979,8 @@ async def _handle_session_action(query):
         _state.current_session_id = session_id
         _state.start_new_session_next = False
         await query.edit_message_text(
-            f"已接管会话：{session.short_id}\n项目：{session.project_label}\n"
+            f"已接管会话：{session.short_id}\n"
+            f"工作区：{session.project_path}\n"
             "直接发消息即可继续该会话；也可用「@会话前8位 消息」指定任意会话。"
         )
         return
@@ -2007,7 +2068,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"⏳ 会话 {target_session_id[:8]} 当前有任务在执行，已加入该会话队列。\n"
                 f"队列位置：{len(_state.task_queue)} | 任务编号：#{queued.task_number}\n"
-                f"项目：{_state.current_project_label}\n"
+                f"工作区：{target_path}\n"
                 f"内容：{prompt[:100]}\n"
                 "可用 /queue 查看，/queue clear 清空。"
             )
@@ -2022,7 +2083,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         action = "新会话" if force_new or not session_id else f"继续会话 {session_id[:8]}"
         await update.message.reply_text(
             f"已开始任务 #{_state.current_task_id}\n"
-            f"项目：{_state.current_project_label}\n"
+            f"工作区：{target_path}\n"
             f"模式：{action}\n"
             f"内容：{prompt[:120]}"
         )

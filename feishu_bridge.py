@@ -136,7 +136,11 @@ class FeishuTransport:
         }
         await asyncio.to_thread(self._create_message, target, "interactive", json.dumps(card))
 
-    async def send_project_choices(self, choices: list[tuple[str, str]]) -> None:
+    async def send_project_choices(
+        self,
+        choices: list[tuple[str, str]],
+        title: str = "选择工作区",
+    ) -> None:
         target = self.chat_id
         if not target:
             return
@@ -144,7 +148,7 @@ class FeishuTransport:
             group = choices[offset:offset + 5]
             card = {
                 "config": {"wide_screen_mode": True},
-                "header": {"title": {"tag": "plain_text", "content": "选择要切换的项目"}},
+                "header": {"title": {"tag": "plain_text", "content": title[:100]}},
                 "elements": [{
                     "tag": "action",
                     "actions": [

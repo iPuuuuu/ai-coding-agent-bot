@@ -37,8 +37,8 @@ class StubTransport:
     async def send_command_menu(self, choices) -> None:
         self.cards.append({"kind": "menu", "choices": choices})
 
-    async def send_project_choices(self, choices) -> None:
-        self.cards.append({"kind": "project", "choices": choices})
+    async def send_project_choices(self, choices, title="选择工作区") -> None:
+        self.cards.append({"kind": "project", "title": title, "choices": choices})
 
     async def send_session_cards(self, heading, sessions) -> None:
         self.cards.append({"kind": "sessions", "heading": heading, "sessions": sessions})
@@ -54,6 +54,9 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         self._sessions = dict(bot._state.sessions)
         self._queue = list(bot._state.task_queue)
         self._tasks = dict(bot._running_tasks)
+        self._current_cwd = bot._state.current_cwd
+        self._current_session_id = bot._state.current_session_id
+        self._start_new_session_next = bot._state.start_new_session_next
         bot._state.sessions.clear()
         bot._state.task_queue.clear()
         bot._running_tasks.clear()
@@ -73,11 +76,21 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         bot._running_tasks.clear()
         bot._running_tasks.update(self._tasks)
         bot._state.pending_by_session.clear()
+        bot._state.set_current_project(self._current_cwd)
+        bot._state.current_session_id = self._current_session_id
+        bot._state.start_new_session_next = self._start_new_session_next
 
     def _dispatch(self, text: str) -> StubTransport:
         transport = StubTransport()
         channel.init_feishu(transport)
         asyncio.run(bot.dispatch_feishu_text("ou_test_open_id", "oc_test_chat", text, transport))
+        return transport
+
+    def _dispatch_button(self, callback_data: str) -> StubTransport:
+        transport = StubTransport()
+        transport.set_chat_id("oc_test_chat")
+        channel.init_feishu(transport)
+        asyncio.run(bot.dispatch_feishu_button("ou_test_open_id", callback_data, transport))
         return transport
 
     def test_sessions_command_sends_cards(self):
@@ -90,6 +103,32 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
     def test_help_command_sends_menu(self):
         transport = self._dispatch("/help")
         self.assertTrue(any(card["kind"] == "menu" for card in transport.cards))
+
+    def test_new_command_asks_for_workspace(self):
+        transport = self._dispatch("/new")
+        picker = next(card for card in transport.cards if card["kind"] == "project")
+        self.assertEqual(picker["title"], "选择新会话工作区")
+        self.assertTrue(all(data.startswith("workspace:new:") for _, data in picker["choices"]))
+        self.assertTrue(any("请选择新会话所在的工作区" in text for text in transport.sent))
+
+    def test_workspace_button_forces_new_session_in_selected_path(self):
+        path = next(iter(bot._state.projects.values())).path
+        transport = self._dispatch_button("workspace:new:0")
+        self.assertEqual(bot._state.current_cwd, path)
+        self.assertEqual(bot._state.current_session_id, "")
+        self.assertTrue(bot._state.start_new_session_next)
+        self.assertTrue(any(path in text for text in transport.sent))
+
+        started: list[tuple[str, str, str]] = []
+
+        def fake_start_run(prompt, project_path, session_key, session_id):
+            started.append((project_path, session_key, session_id))
+
+        with mock.patch.object(bot, "_start_run", fake_start_run):
+            self._dispatch("开始实现")
+        self.assertEqual(started[0][0], path)
+        self.assertTrue(started[0][1].startswith("new:"))
+        self.assertEqual(started[0][2], "")
 
     def test_unauthorized_rejected(self):
         transport = StubTransport()

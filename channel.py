@@ -214,17 +214,21 @@ async def send_command_menu():
     await _bot.send_message(chat_id=_chat_id, text="快捷操作：", reply_markup=keyboard)
 
 
-async def send_project_choices(choices: list[tuple[str, str]]):
+async def send_project_choices(
+    choices: list[tuple[str, str]],
+    title: str = "选择工作区",
+    prompt: str = "请选择要切换的工作区：",
+):
     if not choices or (not _bot and _feishu is None):
         return
     if _feishu is not None:
-        await _feishu.send_project_choices(choices)
+        await _feishu.send_project_choices(choices, title=title)
         return
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton(label[:48], callback_data=data)] for label, data in choices]
     )
-    await _bot.send_message(chat_id=_chat_id, text="请选择要切换的项目：", reply_markup=keyboard)
+    await _bot.send_message(chat_id=_chat_id, text=prompt, reply_markup=keyboard)
 
 
 async def send_session_cards(heading: str, sessions: list[dict]):
