@@ -11,14 +11,24 @@ from feishu_bridge import FeishuTransport
 def _capture(transport: FeishuTransport) -> list[tuple[str, dict]]:
     captured: list[tuple[str, dict]] = []
 
-    def fake_create(chat_id: str, msg_type: str, content: str) -> None:
+    def fake_create(chat_id: str, msg_type: str, content: str) -> str:
         captured.append((msg_type, json.loads(content)))
+        return f"om_{len(captured)}"
 
     transport._create_message = fake_create  # type: ignore[method-assign]
     return captured
 
 
 class SessionCardsJsonTest(unittest.TestCase):
+    def test_send_text_returns_reply_binding_reference(self):
+        transport = FeishuTransport(client=None)
+        transport.chat_id = "oc_test"
+        _capture(transport)
+
+        refs = asyncio.run(transport.send_text("完成"))
+
+        self.assertEqual(refs, ["feishu:oc_test:om_1"])
+
     def test_session_cards_are_valid_cards(self):
         transport = FeishuTransport(client=None)
         transport.chat_id = "oc_test"

@@ -42,6 +42,7 @@ class StatePersistenceTest(unittest.TestCase):
         snap.add_entry("user", "帮我修 bug", "sess-123")
         snap.add_entry("assistant/text", "已修复", "sess-123")
         source.current_session_id = "sess-123"
+        source.bind_message("feishu:chat:message", "sess-123", "/tmp/p1", "assistant")
         source.enqueue_task("队列任务A", "/tmp/p1", "sess-123", False)
         source.enqueue_task("队列任务B", "/tmp/p1", "sess-123", True)
         source.task_counter = 5
@@ -67,6 +68,7 @@ class StatePersistenceTest(unittest.TestCase):
         self.assertEqual(restored.task_queue[1].prompt, "队列任务A")
         self.assertEqual(restored.task_queue[2].force_new, True)
         self.assertEqual(restored.task_counter, 9)
+        self.assertIn("feishu:chat:message", restored.message_bindings)
         texts = [entry.text for entry in restored.projects[bot._norm_path("/tmp/p1")].transcript]
         self.assertIn("帮我修 bug", texts)
         self.assertIn("已修复", texts)
@@ -75,6 +77,17 @@ class StatePersistenceTest(unittest.TestCase):
         restored = bot.RuntimeState()
         bot._apply_state(restored, {"sessions": "not-a-list", "projects": None})
         self.assertEqual(len(restored.sessions), 0)
+
+    def test_new_session_draft_round_trip(self):
+        source = bot.RuntimeState()
+        source.begin_new_session("/tmp/new", ttl_seconds=600)
+        data = bot._dump_state(source)
+
+        restored = bot.RuntimeState()
+        bot._apply_state(restored, data)
+
+        self.assertTrue(restored.new_session_pending())
+        self.assertEqual(restored.new_session_project, bot._norm_path("/tmp/new"))
 
 
 if __name__ == "__main__":

@@ -42,22 +42,26 @@ class FeishuTransport:
         except Exception:
             log.warning("无法持久化 chat_id", exc_info=True)
 
-    async def send_text(self, text: str, chat_id: str = "") -> None:
+    async def send_text(self, text: str, chat_id: str = "") -> list[str]:
         target = chat_id or self.chat_id
         if not target or not text:
             if text and not target:
                 log.warning("send_text 被跳过：chat_id 为空（尚未收到过任何飞书消息，无法知道回复给谁）")
-            return
+            return []
         # Feishu text messages have a 150 KiB content limit.  A smaller chunk
         # also keeps long Claude output readable in the mobile client.
+        refs: list[str] = []
         for start in range(0, len(text), 12_000):
             content = json.dumps({"text": text[start:start + 12_000]})
-            await asyncio.to_thread(self._create_message, target, "text", content)
+            message_id = await asyncio.to_thread(self._create_message, target, "text", content)
+            if message_id:
+                refs.append(f"feishu:{target}:{message_id}")
+        return refs
 
-    async def send_choice(self, text: str, options: list[str], choice_id: str, title: str = "需要你的选择") -> None:
+    async def send_choice(self, text: str, options: list[str], choice_id: str, title: str = "需要你的选择") -> list[str]:
         target = self.chat_id
         if not target:
-            return
+            return []
         card = {
             "config": {"wide_screen_mode": True},
             "header": {"title": {"tag": "plain_text", "content": title[:100]}},
@@ -77,7 +81,8 @@ class FeishuTransport:
                 },
             ],
         }
-        await asyncio.to_thread(self._create_message, target, "interactive", json.dumps(card))
+        message_id = await asyncio.to_thread(self._create_message, target, "interactive", json.dumps(card))
+        return [f"feishu:{target}:{message_id}"] if message_id else []
 
     async def send_monitor_choices(self, text: str, choices: list[tuple[str, str]]) -> None:
         """Send session buttons in small cards for readable mobile layouts."""
@@ -114,9 +119,9 @@ class FeishuTransport:
             return
         card = {
             "config": {"wide_screen_mode": True},
-            "header": {"title": {"tag": "plain_text", "content": "Claude / Codex 控制台"}},
+            "header": {"title": {"tag": "plain_text", "content": "🤖 Coding Agent"}},
             "elements": [
-                {"tag": "markdown", "content": "点击按钮即可查看状态或操作，无需手动输入命令。"},
+                {"tag": "markdown", "content": "选择下一步操作，无需输入会话编号。"},
                 *[
                     {
                         "tag": "action",
@@ -213,7 +218,7 @@ class FeishuTransport:
         except Exception as exc:
             await self.send_text(f"⚠️ 图片发送失败：{exc}")
 
-    def _create_message(self, chat_id: str, msg_type: str, content: str) -> None:
+    def _create_message(self, chat_id: str, msg_type: str, content: str) -> str:
         import lark_oapi as lark
 
         request = (
@@ -231,6 +236,7 @@ class FeishuTransport:
         response = self.client.im.v1.message.create(request)
         if not response.success():
             raise RuntimeError(f"Feishu send failed: code={response.code}, msg={response.msg}")
+        return str(getattr(response.data, "message_id", "") or "")
 
     def _upload_image(self, path: str) -> str:
         import lark_oapi as lark
@@ -312,7 +318,16 @@ def run() -> None:
                 config.ALLOWED_FEISHU_OPEN_ID,
             )
             return
-        schedule(bot.dispatch_feishu_text(open_id, chat_id, text, transport))
+        reply_message_id = str(
+            getattr(message, "parent_id", "") or getattr(message, "root_id", "") or ""
+        )
+        schedule(bot.dispatch_feishu_text(
+            open_id,
+            chat_id,
+            text,
+            transport,
+            reply_message_id=reply_message_id,
+        ))
         log.info("Feishu 消息已提交主循环处理：open_id=%s chat_id=%s", open_id, chat_id)
 
     def on_card_action(data: Any) -> dict:

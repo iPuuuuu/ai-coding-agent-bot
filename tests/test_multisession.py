@@ -67,6 +67,24 @@ class PendingBySessionTest(unittest.TestCase):
         state.clear_pending("sess-2")
         self.assertIsNone(state.pending)
 
+    def test_background_wait_does_not_steal_current_session(self):
+        state = bot.RuntimeState()
+        state.bind_session("current", "/tmp/current", "当前会话")
+        state.bind_session("background", "/tmp/other", "后台会话", set_focus=False)
+        state.current_session_id = "current"
+        state.current_cwd = "/tmp/current"
+
+        state.mark_waiting(bot.PendingInteraction(
+            project_path="/tmp/other",
+            project_label="other",
+            session_id="background",
+            prompt_text="需要确认",
+        ))
+
+        self.assertEqual(state.current_session_id, "current")
+        self.assertEqual(state.current_cwd, "/tmp/current")
+        self.assertEqual(state.sessions["background"].mode, "waiting_user_reply")
+
 
 class StopSessionTest(unittest.TestCase):
     def test_stop_dismisses_pending(self):
@@ -196,12 +214,12 @@ class SessionCardsTest(unittest.TestCase):
             cards = bot._build_session_cards()
         self.assertEqual(len(cards), 1)
         card = cards[0]
-        self.assertIn("codex-11", card["title"])
+        self.assertIn("task_complete", card["title"])
         self.assertIn("已完成", card["title"])
-        self.assertIn("工作区：`/tmp/proj`", card["subtitle"])
+        self.assertIn("📁 proj", card["subtitle"])
         labels = [label for label, _ in card["buttons"]]
-        self.assertIn("详情", labels)
-        self.assertIn("焦点", labels)
+        self.assertIn("继续", labels)
+        self.assertIn("查看详情", labels)
         self.assertIn("接管", labels)
         self.assertNotIn("停止", labels)  # not running
 
@@ -220,6 +238,12 @@ class WorkspacePickerTest(unittest.TestCase):
     def test_invalid_workspace_index_is_rejected(self):
         self.assertEqual(bot._resolve_workspace_index("bad"), "")
         self.assertEqual(bot._resolve_workspace_index("999999"), "")
+
+    def test_new_session_draft_expires(self):
+        state = bot.RuntimeState()
+        state.begin_new_session("/tmp/p", ttl_seconds=-1)
+        self.assertFalse(state.new_session_pending())
+        self.assertFalse(state.start_new_session_next)
 
 
 class ExternalMessageForwardTest(unittest.TestCase):

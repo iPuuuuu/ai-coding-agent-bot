@@ -160,6 +160,9 @@ class RuntimeState:
     # user input at the same time.  ``pending`` above mirrors the focused one.
     pending_by_session: dict[str, PendingInteraction] = field(default_factory=dict)
     start_new_session_next: bool = False
+    new_session_project: str = ""
+    new_session_expires_at: float = 0.0
+    message_bindings: dict[str, dict] = field(default_factory=dict)
     task_queue: list[QueuedTask] = field(default_factory=list)
     active_task: Optional[dict] = None
 
@@ -183,6 +186,45 @@ class RuntimeState:
         snap.last_event = self.last_event
         snap.last_active_at = time.time()
         snap.add_entry("system", self.last_event)
+
+    def begin_new_session(self, project_path: str, ttl_seconds: int = 600) -> None:
+        """Enter an explicit, expiring new-session draft state."""
+        norm = _norm_path(project_path)
+        self.set_current_project(norm)
+        self.current_session_id = ""
+        self.start_new_session_next = True
+        self.new_session_project = norm
+        self.new_session_expires_at = time.time() + ttl_seconds
+
+    def cancel_new_session(self) -> None:
+        self.start_new_session_next = False
+        self.new_session_project = ""
+        self.new_session_expires_at = 0.0
+
+    def new_session_pending(self) -> bool:
+        if not self.start_new_session_next:
+            return False
+        if not self.new_session_project or self.new_session_expires_at <= time.time():
+            self.cancel_new_session()
+            return False
+        return True
+
+    def bind_message(self, message_key: str, session_id: str, project_path: str, message_type: str) -> None:
+        if not message_key or not session_id:
+            return
+        self.message_bindings[message_key] = {
+            "session_id": session_id,
+            "project_path": _norm_path(project_path),
+            "message_type": message_type,
+            "created_at": time.time(),
+        }
+        if len(self.message_bindings) > 1000:
+            oldest = sorted(
+                self.message_bindings,
+                key=lambda key: float(self.message_bindings[key].get("created_at", 0)),
+            )[: len(self.message_bindings) - 1000]
+            for key in oldest:
+                self.message_bindings.pop(key, None)
 
     def bind_session(self, session_id: str, project_path: str, initial_prompt: str = "", set_focus: bool = True) -> ManagedSession:
         norm = _norm_path(project_path)
@@ -245,21 +287,31 @@ class RuntimeState:
         session = self.get_current_session()
         return session.session_id if session else ""
 
-    def start_task(self, prompt: str, project_path: str, session_id: str, force_new: bool, session_key: str = ""):
+    def start_task(
+        self,
+        prompt: str,
+        project_path: str,
+        session_id: str,
+        force_new: bool,
+        session_key: str = "",
+        select_target: bool = True,
+    ):
         norm = _norm_path(project_path)
         snap = self.ensure_project(norm)
         self.task_counter += 1
         self.current_task_id = self.task_counter
-        self.current_cwd = norm
-        self.current_project_label = snap.label
-        self.current_session_id = session_id
+        if select_target:
+            self.current_cwd = norm
+            self.current_project_label = snap.label
+            self.current_session_id = session_id
         self.active_prompt = prompt.strip()
         self.started_at = time.time()
         self.mode = "running"
         self.stop_requested = False
         self.waiting_reason = ""
         self.last_error = ""
-        self.start_new_session_next = False
+        if select_target or force_new:
+            self.cancel_new_session()
         self.active_task = {
             "prompt": self.active_prompt,
             "project_path": norm,
@@ -288,16 +340,13 @@ class RuntimeState:
         snap = self.ensure_project(pending.project_path)
         self.mode = "waiting_user_reply"
         self.set_pending(pending)
-        self.current_cwd = pending.project_path
-        self.current_project_label = pending.project_label
-        self.current_session_id = pending.session_id
         self.waiting_reason = pending.prompt_text[:120]
         self.last_event = f"{pending.project_label} 等待你的回复"
         snap.mode = "waiting_user_reply"
         snap.waiting_reason = self.waiting_reason
         snap.last_event = self.last_event
         snap.last_active_at = time.time()
-        self.bind_session(pending.session_id, pending.project_path)
+        self.bind_session(pending.session_id, pending.project_path, set_focus=False)
         session = self.sessions[pending.session_id]
         session.mode = "waiting_user_reply"
         session.last_event = self.last_event
@@ -309,10 +358,7 @@ class RuntimeState:
         self.mode = "running"
         self.waiting_reason = ""
         self.last_event = event
-        self.current_cwd = target_path
-        self.current_project_label = snap.label
         if session_id:
-            self.current_session_id = session_id
             self.clear_pending(session_id)
         snap.mode = "running"
         snap.waiting_reason = ""
@@ -324,8 +370,9 @@ class RuntimeState:
             session.last_event = event
             session.updated_at = time.time()
 
-    def mark_done(self, event: str = "任务完成"):
-        snap = self.ensure_project(self.current_cwd)
+    def mark_done(self, event: str = "任务完成", project_path: str = "", session_id: str = ""):
+        target_path = _norm_path(project_path or self.current_cwd)
+        snap = self.ensure_project(target_path)
         self.mode = "idle"
         self.last_event = event
         self.waiting_reason = ""
@@ -333,22 +380,23 @@ class RuntimeState:
         self.started_at = None
         self.stop_requested = False
         self.current_task_id = None
-        self.start_new_session_next = False
         self.active_task = None
         snap.mode = "idle"
         snap.last_event = event
         snap.waiting_reason = ""
         snap.active_prompt = ""
         snap.last_active_at = time.time()
-        snap.add_entry("system", event, self.current_session_id)
-        session = self.get_current_session()
+        target_session_id = session_id or self.current_session_id
+        snap.add_entry("system", event, target_session_id)
+        session = self.sessions.get(target_session_id)
         if session is not None:
             session.mode = "idle"
             session.last_event = event
             session.updated_at = time.time()
 
-    def mark_error(self, error: str):
-        snap = self.ensure_project(self.current_cwd)
+    def mark_error(self, error: str, project_path: str = "", session_id: str = ""):
+        target_path = _norm_path(project_path or self.current_cwd)
+        snap = self.ensure_project(target_path)
         self.mode = "idle"
         self.last_error = error
         self.last_event = error
@@ -357,7 +405,6 @@ class RuntimeState:
         self.started_at = None
         self.stop_requested = False
         self.current_task_id = None
-        self.start_new_session_next = False
         self.active_task = None
         snap.mode = "idle"
         snap.last_error = error
@@ -365,8 +412,9 @@ class RuntimeState:
         snap.waiting_reason = ""
         snap.active_prompt = ""
         snap.last_active_at = time.time()
-        snap.add_entry("error", error, self.current_session_id)
-        session = self.get_current_session()
+        target_session_id = session_id or self.current_session_id
+        snap.add_entry("error", error, target_session_id)
+        session = self.sessions.get(target_session_id)
         if session is not None:
             session.mode = "idle"
             session.last_event = error
@@ -486,9 +534,12 @@ def _project_label(path: str) -> str:
 def _dump_state(state: RuntimeState) -> dict:
     """Serialize managed sessions, project windows and focus for restart."""
     return {
-        "version": 1,
+        "version": 2,
         "current_cwd": state.current_cwd,
         "current_session_id": state.current_session_id,
+        "new_session_project": state.new_session_project,
+        "new_session_expires_at": state.new_session_expires_at,
+        "message_bindings": dict(state.message_bindings),
         "project_last_session": dict(state.project_last_session),
         "task_counter": state.task_counter,
         "task_queue": [
@@ -637,7 +688,25 @@ def _apply_state(state: RuntimeState, data: dict) -> None:
         state.current_session_id = current_session_id
         state.sessions[current_session_id].mode = "idle"
         state.sessions[current_session_id].last_event += "（重启恢复）"
-    state.start_new_session_next = False
+    new_session_project = str(data.get("new_session_project") or "")
+    new_session_expires_at = float(data.get("new_session_expires_at") or 0)
+    if new_session_project and new_session_expires_at > time.time():
+        state.start_new_session_next = True
+        state.new_session_project = _norm_path(new_session_project)
+        state.new_session_expires_at = new_session_expires_at
+    else:
+        state.cancel_new_session()
+
+    cutoff = time.time() - 90 * 24 * 60 * 60
+    bindings = data.get("message_bindings") or {}
+    if isinstance(bindings, dict):
+        state.message_bindings = {
+            str(key): dict(value)
+            for key, value in bindings.items()
+            if isinstance(value, dict)
+            and float(value.get("created_at", 0) or 0) >= cutoff
+            and str(value.get("session_id") or "")
+        }
 
 
 def _save_state() -> None:
@@ -833,7 +902,77 @@ def _collect_external_sessions() -> list[dict]:
         record["source"] = "codex"
         record["monitor_key"] = f"codex:{record.get('session_id', '')}"
         records.append(record)
+    by_id = {str(item.get("session_id", "")): item for item in records}
+    for session in _state.sessions.values():
+        record = by_id.get(session.session_id)
+        if record is None:
+            record = {
+                "source": "codex",
+                "session_id": session.session_id,
+                "status": session.mode,
+                "cwd": session.project_path,
+                "last_event": session.last_event,
+                "updated_at": session.updated_at,
+                "monitor_key": f"codex:{session.session_id}",
+            }
+            records.append(record)
+            by_id[session.session_id] = record
+        record["title"] = session.title
+        record["cwd"] = session.project_path
+        record["managed"] = True
+        if session.session_id in _state.pending_by_session:
+            record["status"] = "waiting_user_reply"
+        elif session.session_id in _running_tasks and not _running_tasks[session.session_id].done():
+            record["status"] = "running"
     return sorted(records, key=lambda item: float(item.get("updated_at", 0) or 0), reverse=True)
+
+
+def _session_name(session_id: str) -> str:
+    session = _state.sessions.get(session_id)
+    if session is not None:
+        return session.title or session.project_label
+    item = _find_session_record(session_id)
+    return str((item or {}).get("title") or (item or {}).get("last_text") or session_id[:8])[:48]
+
+
+def _bind_message_refs(refs, session_id: str, project_path: str, message_type: str) -> None:
+    for ref in refs or []:
+        _state.bind_message(str(ref), session_id, project_path, message_type)
+
+
+def _reply_message_key(update: Update) -> str:
+    message = getattr(update, "message", None)
+    explicit = str(getattr(message, "reply_message_key", "") or "")
+    if explicit:
+        return explicit
+    replied = getattr(message, "reply_to_message", None)
+    message_id = getattr(replied, "message_id", "")
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", "")
+    if message_id != "" and chat_id != "":
+        return f"telegram:{chat_id}:{message_id}"
+    return ""
+
+
+def _format_home() -> str:
+    session = _state.sessions.get(_state.current_session_id)
+    if session is None:
+        session_line = "💬 当前会话：未选择"
+        status_line = "⚪ 请选择会话或新建会话"
+        progress = ""
+    else:
+        status = _session_status_label(session.mode)
+        session_line = f"💬 当前会话：{session.title}"
+        status_line = f"{('🟡' if session.mode == 'waiting_user_reply' else '🟢' if session.mode == 'running' else '⚪')} {status}"
+        progress = f"\n最近进展：{session.last_event[:80]}" if session.last_event else ""
+    draft = ""
+    if _state.new_session_pending():
+        draft = f"\n\n✍️ 正在新建会话：下一条消息将在 {_project_label(_state.new_session_project)} 中创建新会话。"
+    return (
+        "🤖 Coding Agent\n\n"
+        f"📁 当前工作区：{_state.current_project_label or _project_label(_state.current_cwd)}\n"
+        f"{session_line}\n{status_line}{progress}{draft}\n\n"
+        "请选择下方操作；直接发送消息时会投递到上面显示的目标。"
+    )
 
 
 def _format_monitor_row(item: dict) -> str:
@@ -943,19 +1082,19 @@ def _format_waiting_message(session_id: str, item: dict) -> str:
             reason = "Codex 正在等待你的输入，但这次还没从 transcript 里提取到更具体的问题内容。"
     return (
         f"⚠️ {source_label} 会话需要你操作\n"
-        f"会话：{session_id[:8]}\n"
+        f"会话：{_session_name(session_id)}\n"
         f"项目：{cwd}\n\n"
         f"{reason[:1200]}"
     )
 
 
-def _adopt_global_session(session_id: str) -> ManagedSession | None:
+def _adopt_global_session(session_id: str, set_focus: bool = True) -> ManagedSession | None:
     sessions = _load_global_sessions()
     item = sessions.get(session_id)
     if item:
         cwd = _norm_path(item.get("cwd", config.DEFAULT_PROJECT_DIR) or config.DEFAULT_PROJECT_DIR)
         _state.ensure_project(cwd)
-        session = _state.bind_session(session_id, cwd)
+        session = _state.bind_session(session_id, cwd, set_focus=set_focus)
         session.title = str(item.get("last_text") or item.get("last_event") or session.title)[:48] or session.title
         session.mode = "waiting_user_reply" if item.get("waiting") else item.get("status", "active")
         session.last_event = str(item.get("last_event", session.last_event))
@@ -978,7 +1117,7 @@ def _adopt_global_session(session_id: str) -> ManagedSession | None:
     if codex_item:
         cwd = _norm_path(codex_item.get("cwd") or config.DEFAULT_PROJECT_DIR)
         _state.ensure_project(cwd)
-        session = _state.bind_session(session_id, cwd)
+        session = _state.bind_session(session_id, cwd, set_focus=set_focus)
         session.title = str(codex_item.get("title") or codex_item.get("last_event") or session.title)[:48] or session.title
         session.mode = str(codex_item.get("status", "unknown"))
         session.last_event = str(codex_item.get("last_event") or session.last_event)
@@ -1067,7 +1206,10 @@ def _output_tag(session_id: str) -> str:
     active = [key for key, task in _running_tasks.items() if not task.done()]
     if session_id == _state.current_session_id and len(active) <= 1:
         return ""
-    return f"[会话 {session_id[:8]}]"
+    name = _session_name(session_id)
+    if name == session_id[:8]:
+        return f"[会话 {name}]"
+    return f"[会话：{name}]"
 
 
 def _start_run(prompt: str, project_path: str, session_key: str, session_id: str) -> asyncio.Task:
@@ -1147,10 +1289,11 @@ def _find_session_record(session_id: str) -> dict | None:
 
 def _workspace_choices(action: str) -> list[tuple[str, str]]:
     """Build compact, unambiguous workspace callbacks for phone cards."""
-    return [
+    choices = [
         (f"{snap.label} · {snap.path}", f"workspace:{action}:{index}")
         for index, snap in enumerate(_state.projects.values())
     ]
+    return choices
 
 
 def _resolve_workspace_index(raw_index: str) -> str:
@@ -1173,14 +1316,28 @@ async def _send_new_session_workspace_picker(reply) -> None:
     )
 
 
-def _build_session_cards() -> list[dict]:
+def _build_session_cards(project_path: str = "") -> list[dict]:
     """Build one interactive card per visible session for ``/sessions``."""
     cards: list[dict] = []
-    active_states = {"running", "active", "waiting", "waiting_user_reply"}
     records = _collect_external_sessions()
-    active = [item for item in records if item.get("status") in active_states]
-    recent = [item for item in records if item.get("status") not in active_states][:8]
-    for item in (active + recent)[:14]:
+    if project_path:
+        target_path = _norm_path(project_path)
+        records = [item for item in records if _norm_path(str(item.get("cwd") or "")) == target_path]
+
+    def priority(item: dict) -> tuple[int, float]:
+        status = str(item.get("status") or "")
+        session_id = str(item.get("session_id") or "")
+        if status in {"waiting", "waiting_user_reply"}:
+            rank = 0
+        elif status in {"running", "active"}:
+            rank = 1
+        elif session_id == _state.current_session_id:
+            rank = 2
+        else:
+            rank = 3
+        return rank, -float(item.get("updated_at", 0) or 0)
+
+    for item in sorted(records, key=priority)[:14]:
         source = str(item.get("source", "?"))
         session_id = str(item.get("session_id", ""))
         if not session_id:
@@ -1196,13 +1353,17 @@ def _build_session_cards() -> list[dict]:
         running = status in {"running", "active"} or live_task
         waiting = status in {"waiting", "waiting_user_reply"} or session_id in _state.pending_by_session
         icon = "👉" if is_focus else ("🟢" if running else ("🟡" if waiting else "•"))
-        title = f"{icon} {source.title()} {session_id[:8]} · {status_label}"
-        subtitle = f"工作区：`{workspace}`\n{project} | {event}"
+        display_title = str(item.get("title") or item.get("last_text") or event or f"会话 {session_id[:8]}")[:48]
+        title = f"{icon} {display_title} · {status_label}"
+        subtitle = f"📁 {project}\n最近进展：{event}"
         if managed:
             subtitle += " | 托管"
-        buttons: list[tuple[str, str]] = [("详情", f"sess:detail:{session_id}")]
-        if not is_focus:
-            buttons.append(("焦点", f"sess:focus:{session_id}"))
+        primary = "回复" if waiting else ("查看进度" if running else "继续")
+        primary_action = "detail" if running else "focus"
+        buttons: list[tuple[str, str]] = [(primary, f"sess:{primary_action}:{session_id}")]
+        if running and not is_focus:
+            buttons.append(("设为当前", f"sess:focus:{session_id}"))
+        buttons.append(("查看详情", f"sess:detail:{session_id}"))
         if running:
             buttons.append(("停止", f"sess:stop:{session_id}"))
         if not managed and status != "running":
@@ -1417,7 +1578,7 @@ async def _run_agent(prompt: str, project_path: str, session_key: str, session_i
             session.updated_at = time.time()
             # Focus follows activity only when this run was already the focused
             # target, or it created a brand-new session for the current project.
-            if _state.current_session_id in ("", active_session_id) or session_key.startswith("new:"):
+            if _state.current_session_id == active_session_id or session_key.startswith("new:"):
                 _state.current_session_id = active_session_id
         if outcome.state == "waiting":
             pending = PendingInteraction(
@@ -1448,36 +1609,58 @@ async def _run_agent(prompt: str, project_path: str, session_key: str, session_i
                 choice_id = await channel.send_choice_no_wait(
                     waiting_message,
                     pending.options,
-                    title=f"会话 {pending.session_id[:8]} 需要你的选择",
+                    title=f"「{_session_name(pending.session_id)}」需要你的选择",
                 )
                 if choice_id is not None:
                     _choice_session[choice_id] = pending.session_id
+                    _bind_message_refs(
+                        channel.choice_message_refs(choice_id),
+                        pending.session_id,
+                        pending.project_path,
+                        "choice",
+                    )
                     asyncio.create_task(
                         _expire_waiting(pending, choice_id, config.APPROVAL_TIMEOUT, pending.session_id)
                     )
             else:
-                await channel.send_text(waiting_message, tag=tag)
+                refs = await channel.send_text(waiting_message, tag=tag)
+                _bind_message_refs(refs, pending.session_id, pending.project_path, "waiting")
         elif _state.stop_requested:
             _prune_managed_waiting_notice(active_session_id)
-            _state.mark_done("任务已停止")
-            await channel.send_text(f"⏹️ {snap.label} 已停止（用时 {int(time.time() - started_at)}s）。", tag=tag)
+            _state.mark_done("任务已停止", project_path, active_session_id)
+            refs = await channel.send_text(
+                f"⏹️「{_session_name(active_session_id)}」已停止（用时 {int(time.time() - started_at)}s）。",
+                tag=tag,
+            )
+            _bind_message_refs(refs, active_session_id, project_path, "stopped")
         else:
             _prune_managed_waiting_notice(active_session_id)
-            _state.mark_done("任务完成")
+            _state.mark_done("任务完成", project_path, active_session_id)
             if (outcome.final_text and outcome.final_text != outcome.waiting_text
                     and agent_runner._should_forward_reply(active_session_id or session_key, outcome.final_text)):
-                await channel.send_text(outcome.final_text, tag=tag)
-            await channel.send_text(f"✅ {snap.label} 任务完成（用时 {int(time.time() - started_at)}s）。", tag=tag)
+                refs = await channel.send_text(outcome.final_text, tag=tag)
+                _bind_message_refs(refs, active_session_id, project_path, "assistant")
+            refs = await channel.send_text(
+                f"✅「{_session_name(active_session_id)}」任务完成（用时 {int(time.time() - started_at)}s）。",
+                tag=tag,
+            )
+            _bind_message_refs(refs, active_session_id, project_path, "completed")
     except asyncio.CancelledError:
         _prune_managed_waiting_notice(session_id)
-        _state.mark_done("任务已取消")
-        await channel.send_text(f"{snap.label} 已取消。", tag=tag)
+        _state.mark_done("任务已取消", project_path, session_id)
+        refs = await channel.send_text(f"⏹️「{_session_name(session_id)}」已取消。", tag=tag)
+        _bind_message_refs(refs, session_id, project_path, "cancelled")
         raise
     except Exception as e:
         log.exception("run_agent failed")
         _prune_managed_waiting_notice(session_id)
-        _state.mark_error(f"Agent 运行出错：{type(e).__name__}: {e}")
-        await channel.send_text(f"{snap.label} 出错：{type(e).__name__}: {e}", tag=tag)
+        _state.mark_error(f"Agent 运行出错：{type(e).__name__}: {e}", project_path, session_id)
+        refs = await channel.send_text(
+            f"🔴「{_session_name(session_id)}」执行失败\n原因：{type(e).__name__}: {e}\n"
+            "会话上下文已保留，可以稍后继续。",
+            tag=tag,
+        )
+        _bind_message_refs(refs, session_id, project_path, "error")
     finally:
         heartbeat.cancel()
         _running_tasks.pop(session_key, None)
@@ -1563,10 +1746,11 @@ async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_unauthorized(update)
         return
     if not ctx.args:
-        choices = "\n".join(f"- {snap.label}: {snap.path}" for snap in _state.projects.values())
         await update.message.reply_text(
-            f"当前项目：{_state.current_project_label}\n可选项目：\n{choices}\n用法：/project bot 或 /project C:/code/myapp"
+            f"📁 当前工作区：{_state.current_project_label or _project_label(_state.current_cwd)}\n"
+            "请选择要切换到的工作区："
         )
+        await channel.send_project_choices(_workspace_choices("switch"), title="切换工作区")
         return
     raw = " ".join(ctx.args).strip()
     target = None
@@ -1581,10 +1765,14 @@ async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     _state.ensure_project(target)
     _state.set_current_project(target)
-    session = _state.get_current_session()
-    session_text = session.short_id if session else "无"
+    suggested_id = _state.project_last_session.get(_state.current_cwd, "")
+    session = _state.sessions.get(suggested_id)
+    _state.current_session_id = ""
+    _state.cancel_new_session()
     await update.message.reply_text(
-        f"已切到：{_state.current_project_label}\n路径：{_state.current_cwd}\n当前会话：{session_text}"
+        f"✓ 已切换工作区「{_state.current_project_label}」\n"
+        f"最近会话：{session.title if session else '无'}\n"
+        "请选择继续最近会话、选择其他会话或新建会话。"
     )
 
 
@@ -1621,10 +1809,11 @@ async def cmd_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     _state.set_current_project(session.project_path)
     _state.current_session_id = session_id
-    _state.start_new_session_next = False
+    _state.cancel_new_session()
     await update.message.reply_text(
-        f"已设为焦点会话：{session.short_id}\n工作区：{session.project_path}\n标题：{session.title}\n"
-        "直接发消息即可继续该会话；也可用「@会话前8位 消息」指定任意会话。"
+        f"✓ 已设为当前会话「{session.title}」\n"
+        f"📁 工作区：{session.project_label}\n"
+        "直接发送消息即可继续。"
     )
 
 
@@ -1640,14 +1829,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         await _send_unauthorized(update)
         return
-    await update.message.reply_text(
-        "Codex 会话机器人已上线（旧 Claude 会话仅保留只读监控）。\n"
-        "支持多会话并行：普通消息发给当前焦点会话；\n"
-        "用「@会话前8位 消息」可直接指挥任意会话。\n"
-        "下方卡片可直接查看状态、监控会话、切换项目或新建会话。\n"
-        "发送 /health 可检查本机环境；完整命令见 /help。"
-    )
-    await channel.send_command_menu()
+    await update.message.reply_text(_format_home())
+    await channel.send_command_menu(has_current_session=bool(_state.current_session_id))
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1655,15 +1838,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_unauthorized(update)
         return
     await update.message.reply_text(
-        "常用操作请直接点击下方卡片。\n"
+        "常用操作请直接点击下方按钮，不需要输入会话编号。\n"
         "命令：/monitor /status /sessions /project /new /use /stop /queue /health\n"
-        "多会话技巧：\n"
-        "- 「@会话前8位 消息」＝ 指定任意会话执行任务\n"
-        "- 「@会话前8位」＝ 仅切换焦点会话\n"
-        "- /stop 停止焦点会话，/stop <前8位> 停止指定会话，/stop all 全部停止\n"
-        "- /sessions 每个会话有操作卡片（详情/焦点/停止/接管）"
+        "直接回复某条 Bot 消息，会自动回到那条消息所属的会话。\n"
+        "高级用法：@会话前8位 消息；/stop all 停止全部任务。"
     )
-    await channel.send_command_menu()
+    await channel.send_command_menu(has_current_session=bool(_state.current_session_id))
 
 
 async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1755,11 +1935,13 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         await _send_unauthorized(update)
         return
-    await update.message.reply_text(_state.session_summary() + "\n\n" + _format_session_overview())
+    await update.message.reply_text(
+        f"选择要继续的会话\n📁 当前工作区：{_state.current_project_label or _project_label(_state.current_cwd)}"
+    )
     cards = _build_session_cards()
     if cards:
         await channel.send_session_cards(
-            "点击按钮可查看详情 / 设为焦点 / 停止 / 接管对应会话：", cards
+            "会话已按需要处理、运行中和最近更新排序。", cards
         )
     else:
         await update.message.reply_text("暂无本机会话记录。")
@@ -1789,18 +1971,44 @@ async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _handle_dashboard_action(action: str, query):
     """Run a common action from an inline/card button without fake messages."""
-    if action == "status":
+    if action == "continue":
+        session = _state.sessions.get(_state.current_session_id)
+        if session is None:
+            await query.edit_message_text("当前还没有选择会话。请选择已有会话，或新建一个会话。")
+            cards = _build_session_cards()
+            if cards:
+                await channel.send_session_cards("选择一个会话继续：", cards)
+            else:
+                await _send_new_session_workspace_picker(channel.send_text)
+        else:
+            await query.edit_message_text(
+                f"💬 当前会话：「{session.title}」\n"
+                f"📁 工作区：{session.project_label}\n"
+                f"状态：{_session_status_label(session.mode)}\n"
+                f"最近进展：{session.last_event[:120]}\n\n"
+                "直接发送消息即可继续这个会话。"
+            )
+    elif action == "status":
         await query.edit_message_text(_state.summary() + "\n\n" + _format_session_overview())
     elif action == "monitor":
         await query.edit_message_text(_format_session_overview())
         await channel.send_monitor_choices("点击一个会话，查看详情：", _monitor_button_choices())
     elif action == "sessions":
-        await query.edit_message_text(_state.session_summary() + "\n\n" + _format_session_overview())
+        await query.edit_message_text(
+            f"选择要继续的会话\n📁 当前工作区：{_state.current_project_label or _project_label(_state.current_cwd)}"
+        )
         cards = _build_session_cards()
         if cards:
             await channel.send_session_cards(
-                "点击按钮可查看详情 / 设为焦点 / 停止 / 接管对应会话：", cards
+                "会话已按需要处理、运行中和最近更新排序。", cards
             )
+    elif action == "active":
+        cards = [card for card in _build_session_cards() if "运行中" in card["title"] or "等待回复" in card["title"]]
+        await query.edit_message_text(
+            f"当前有 {len(cards)} 个运行中或等待处理的会话。" if cards else "当前没有运行中或等待处理的会话。"
+        )
+        if cards:
+            await channel.send_session_cards("运行与待处理会话：", cards)
     elif action == "project":
         await query.edit_message_text(f"当前工作区：{_state.current_cwd}\n请选择要切换的工作区：")
         await channel.send_project_choices(_workspace_choices("switch"), title="切换工作区")
@@ -1817,6 +2025,12 @@ async def _handle_dashboard_action(action: str, query):
             await query.edit_message_text("\n".join(lines))
     elif action == "new":
         await _send_new_session_workspace_picker(query.edit_message_text)
+    elif action == "help":
+        await query.edit_message_text(
+            "直接发送消息会进入当前会话；回复某条 Bot 消息会进入那条消息所属会话。\n"
+            "使用「选择会话」「新建会话」「切换工作区」即可完成日常操作。\n"
+            "发送 /help 可查看兼容命令。"
+        )
     elif action == "stop":
         if _stop_session_run(_state.current_session_id):
             await query.edit_message_text(f"已请求停止：{_state.current_project_label}")
@@ -1847,28 +2061,35 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await query.edit_message_text("工作区按钮数据无效。请重新打开快捷面板。")
             return
+        if action == "cancel":
+            _state.cancel_new_session()
+            await query.edit_message_text("已取消。当前选择未改变。")
+            return
         target = _resolve_workspace_index(raw_index)
         if not target:
             await query.edit_message_text("该工作区已不在列表中。请重新打开快捷面板。")
             return
         _state.set_current_project(target)
         if action == "new":
-            _state.current_session_id = ""
-            _state.start_new_session_next = True
+            _state.begin_new_session(target)
             await query.edit_message_text(
-                f"已选择新会话工作区：{_state.current_project_label}\n"
-                f"路径：{_state.current_cwd}\n\n直接发送任务内容，将在此工作区新建 Codex 会话。"
+                "✍️ 已准备新会话\n"
+                f"📁 工作区：{_state.current_project_label}\n"
+                f"路径：{_state.current_cwd}\n\n"
+                "请直接发送第一条任务。发送前不会创建空会话；10 分钟内未发送将自动取消。"
             )
             return
         if action != "switch":
             await query.edit_message_text("未知的工作区操作。请重新打开快捷面板。")
             return
-        _state.start_new_session_next = False
-        session = _state.get_current_session()
-        session_label = session.short_id if session else "无"
+        suggested_id = _state.project_last_session.get(_state.current_cwd, "")
+        session = _state.sessions.get(suggested_id)
+        _state.current_session_id = ""
+        _state.cancel_new_session()
         await query.edit_message_text(
-            f"已切换工作区：{_state.current_project_label}\n"
-            f"路径：{_state.current_cwd}\n当前会话：{session_label}"
+            f"✓ 已切换工作区「{_state.current_project_label}」\n"
+            f"最近会话：{session.title if session else '无'}\n"
+            "请选择继续最近会话、选择其他会话或新建会话。"
         )
         return
     if query.data.startswith("project:"):
@@ -1879,11 +2100,14 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("该工作区已不在列表中。请重新打开快捷面板。")
             return
         _state.set_current_project(target)
-        session = _state.get_current_session()
-        session_label = session.short_id if session else "无"
+        suggested_id = _state.project_last_session.get(_state.current_cwd, "")
+        session = _state.sessions.get(suggested_id)
+        _state.current_session_id = ""
+        _state.cancel_new_session()
         await query.edit_message_text(
-            f"已切换工作区：{_state.current_project_label}\n"
-            f"路径：{_state.current_cwd}\n当前会话：{session_label}"
+            f"✓ 已切换工作区「{_state.current_project_label}」\n"
+            f"最近会话：{session.title if session else '无'}\n"
+            "请选择继续最近会话、选择其他会话或新建会话。"
         )
         return
     if query.data.startswith("monitor:"):
@@ -1916,10 +2140,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     snap = _state.ensure_project(pending.project_path)
     snap.add_entry("user/choice", choice, pending.session_id)
-    _state.set_current_project(pending.project_path)
-    _state.current_session_id = pending.session_id
     _state.mark_running(f"收到你的选择：{choice}", pending.project_path, pending.session_id)
-    await query.edit_message_text(query.message.text + f"\n\n你选择了：{choice}")
+    await query.edit_message_text(
+        query.message.text
+        + f"\n\n✓ 已回复到「{_session_name(pending.session_id)}」：{choice}"
+    )
 
     _start_run(choice, pending.project_path, pending.session_id, pending.session_id)
 
@@ -1950,11 +2175,12 @@ async def _handle_session_action(query):
             return
         _state.set_current_project(session.project_path)
         _state.current_session_id = session_id
-        _state.start_new_session_next = False
+        _state.cancel_new_session()
         await query.edit_message_text(
-            f"已设为焦点会话：{session.short_id} | {session.project_label}\n"
-            f"工作区：{session.project_path}\n"
-            "直接发消息即可继续该会话。"
+            f"✓ 已设为当前会话「{session.title}」\n"
+            f"📁 工作区：{session.project_label}\n"
+            f"状态：{_session_status_label(session.mode)}\n\n"
+            "直接发送消息即可继续这个会话。"
         )
         return
     if action == "stop":
@@ -1977,11 +2203,11 @@ async def _handle_session_action(query):
             return
         _state.set_current_project(session.project_path)
         _state.current_session_id = session_id
-        _state.start_new_session_next = False
+        _state.cancel_new_session()
         await query.edit_message_text(
-            f"已接管会话：{session.short_id}\n"
-            f"工作区：{session.project_path}\n"
-            "直接发消息即可继续该会话；也可用「@会话前8位 消息」指定任意会话。"
+            f"✓ 已接管并设为当前会话「{session.title}」\n"
+            f"📁 工作区：{session.project_label}\n"
+            "直接发送消息即可继续。"
         )
         return
     await query.edit_message_text("未知的会话操作。请重新发送 /sessions。")
@@ -1999,10 +2225,32 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     async with _task_lock:
-        # ---- 解析目标会话：@会话前8位 前缀路由，否则当前焦点会话 ----
+        # ---- 路由优先级：回复绑定 > @前缀 > 显式新建态 > 当前会话 ----
+        reply_key = _reply_message_key(update)
+        reply_binding = _state.message_bindings.get(reply_key) if reply_key else None
+        reply_routed = reply_binding is not None
+        if reply_key and reply_binding is None:
+            await update.message.reply_text(
+                "这条历史消息已无法定位到原会话，为避免发错，我没有发送。\n"
+                "请从会话列表选择目标，或新建会话。"
+            )
+            cards = _build_session_cards()
+            if cards:
+                await channel.send_session_cards("请选择目标会话：", cards)
+            return
+
         routed_session_id, remainder, routed = _resolve_target(prompt)
-        if routed:
+        if reply_routed:
+            routed_session_id = str(reply_binding.get("session_id") or "")
+            target_path = _norm_path(str(reply_binding.get("project_path") or _state.current_cwd))
+            routed = True
+        elif routed:
             prompt = remainder
+            target_path = _state.current_cwd
+        else:
+            target_path = _state.current_cwd
+
+        if routed:
             if not _is_controllable_session(routed_session_id):
                 await update.message.reply_text(
                     "该会话是旧 Claude 只读会话，无法用 Codex 继续。请回到原终端操作。"
@@ -2013,19 +2261,22 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if blocked:
                     await update.message.reply_text(blocked)
                     return
-                adopted = _adopt_global_session(routed_session_id)
+                adopted = _adopt_global_session(routed_session_id, set_focus=not reply_routed)
                 if adopted is None:
                     await update.message.reply_text("这个会话目前只能查看摘要，暂时还不能接管。")
                     return
-            _state.start_new_session_next = False
-            _state.current_session_id = routed_session_id
-            _state.set_current_project(_state.sessions[routed_session_id].project_path)
+            target_path = _state.sessions[routed_session_id].project_path
+            if not reply_routed:
+                _state.cancel_new_session()
+                _state.set_current_project(target_path)
+                _state.current_session_id = routed_session_id
             if not prompt:
                 # "@<id>" 单独一条 = 仅切换焦点
                 session = _state.sessions[routed_session_id]
                 await update.message.reply_text(
-                    f"已设为焦点会话：{session.short_id} | {session.project_label}\n"
-                    "直接发消息即可继续该会话。"
+                    f"✓ 已设为当前会话「{session.title}」\n"
+                    f"📁 工作区：{session.project_label}\n"
+                    "直接发送消息即可继续。"
                 )
                 return
         else:
@@ -2039,7 +2290,20 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     target_session_id = ""
         if routed:
             target_session_id = routed_session_id
-        target_path = _state.current_cwd
+
+        force_new = _state.new_session_pending()
+        if not target_session_id and not force_new:
+            await update.message.reply_text(
+                "还没有明确发送目标。请选择一个会话，或先新建会话；这条消息尚未发送。"
+            )
+            cards = _build_session_cards()
+            if cards:
+                await channel.send_session_cards("要把这条消息发到哪里？", cards)
+            else:
+                await _send_new_session_workspace_picker(channel.send_text)
+            return
+        if force_new:
+            target_path = _state.new_session_project
 
         # ---- 目标会话正在等待回复 → 作为答复继续它 ----
         pending = _state.pending_by_session.get(target_session_id) if target_session_id else None
@@ -2047,12 +2311,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _prune_managed_waiting_notice(pending.session_id)
             session_id = pending.session_id
             _state.clear_pending(session_id)
-            _state.set_current_project(target_path)
-            _state.current_session_id = session_id
             _state.ensure_project(target_path).add_entry("user", prompt, session_id)
             _state.mark_running(f"收到你的回复，继续处理 {pending.project_label}", target_path, session_id)
             await update.message.reply_text(
-                f"继续处理：{pending.project_label} / {session_id[:8]}"
+                f"✓ 已回复到「{_session_name(session_id)}」\n📁 {pending.project_label}"
             )
             _start_run(prompt, target_path, session_id, session_id)
             return
@@ -2060,13 +2322,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ---- 目标会话忙 → 排入该会话队列 ----
         target_running = target_session_id in _running_tasks and not _running_tasks[target_session_id].done()
         if target_running:
-            force_new = _state.start_new_session_next
-            _state.start_new_session_next = False
+            force_new = False
             queued = _state.enqueue_task(
                 prompt, target_path, target_session_id, force_new, session_key=target_session_id
             )
             await update.message.reply_text(
-                f"⏳ 会话 {target_session_id[:8]} 当前有任务在执行，已加入该会话队列。\n"
+                f"🕓 已加入「{_session_name(target_session_id)}」队列。\n"
                 f"队列位置：{len(_state.task_queue)} | 任务编号：#{queued.task_number}\n"
                 f"工作区：{target_path}\n"
                 f"内容：{prompt[:100]}\n"
@@ -2075,16 +2336,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         # ---- 空闲 → 直接开始 ----
-        force_new = _state.start_new_session_next
-        _state.start_new_session_next = False
         session_id = "" if force_new else target_session_id
-        _state.start_task(prompt, target_path, session_id, force_new)
+        _state.start_task(prompt, target_path, session_id, force_new, select_target=not reply_routed)
         session_key = session_id or f"new:{_state.current_task_id}"
-        action = "新会话" if force_new or not session_id else f"继续会话 {session_id[:8]}"
+        action = "新会话" if force_new or not session_id else f"继续「{_session_name(session_id)}」"
         await update.message.reply_text(
-            f"已开始任务 #{_state.current_task_id}\n"
-            f"工作区：{target_path}\n"
-            f"模式：{action}\n"
+            f"✓ 已开始任务 #{_state.current_task_id}\n"
+            f"📁 {_project_label(target_path)}\n"
+            f"💬 {action}\n"
             f"内容：{prompt[:120]}"
         )
         _start_run(prompt, target_path, session_key, session_id)
@@ -2119,9 +2378,12 @@ class _FeishuChat:
 
 
 class _FeishuMessage:
-    def __init__(self, text: str, transport):
+    def __init__(self, text: str, transport, chat_id: str = "", reply_message_id: str = ""):
         self.text = text
         self._transport = transport
+        self.reply_message_key = (
+            f"feishu:{chat_id}:{reply_message_id}" if chat_id and reply_message_id else ""
+        )
 
     async def reply_text(self, text: str):
         await self._transport.send_text(text)
@@ -2143,9 +2405,17 @@ class _FeishuQuery:
 
 
 class _FeishuUpdate:
-    def __init__(self, open_id: str, transport, text: str = "", callback_data: str = ""):
+    def __init__(
+        self,
+        open_id: str,
+        transport,
+        text: str = "",
+        callback_data: str = "",
+        chat_id: str = "",
+        reply_message_id: str = "",
+    ):
         self.effective_chat = _FeishuChat(open_id)
-        self.message = _FeishuMessage(text, transport) if not callback_data else None
+        self.message = _FeishuMessage(text, transport, chat_id, reply_message_id) if not callback_data else None
         self.callback_query = _FeishuQuery(callback_data, transport) if callback_data else None
 
 
@@ -2154,13 +2424,25 @@ class _FeishuContext:
         self.args = args or []
 
 
-async def dispatch_feishu_text(open_id: str, chat_id: str, text: str, transport):
+async def dispatch_feishu_text(
+    open_id: str,
+    chat_id: str,
+    text: str,
+    transport,
+    reply_message_id: str = "",
+):
     """Translate a Feishu text event into the existing command/message core."""
     transport.set_chat_id(chat_id)
     # Strip Feishu's own mention placeholders ("@_user_1 …") so that an
     # @-mention of the bot does not shadow the "@会话前8位" routing prefix.
     text = re.sub(r"@_user_\d+\s*", "", text).strip()
-    update = _FeishuUpdate(open_id, transport, text=text)
+    update = _FeishuUpdate(
+        open_id,
+        transport,
+        text=text,
+        chat_id=chat_id,
+        reply_message_id=reply_message_id,
+    )
     if not text:
         return
     command, _, remainder = text.partition(" ")

@@ -57,10 +57,15 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         self._current_cwd = bot._state.current_cwd
         self._current_session_id = bot._state.current_session_id
         self._start_new_session_next = bot._state.start_new_session_next
+        self._new_session_project = bot._state.new_session_project
+        self._new_session_expires_at = bot._state.new_session_expires_at
+        self._message_bindings = dict(bot._state.message_bindings)
         bot._state.sessions.clear()
         bot._state.task_queue.clear()
         bot._running_tasks.clear()
         bot._state.pending_by_session.clear()
+        bot._state.cancel_new_session()
+        bot._state.message_bindings.clear()
         self.sid = "deadbeef12345678"
         bot._state.sessions[self.sid] = bot.ManagedSession(
             session_id=self.sid, project_path="/tmp/p", project_label="p", title="冒烟会话"
@@ -79,6 +84,10 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         bot._state.set_current_project(self._current_cwd)
         bot._state.current_session_id = self._current_session_id
         bot._state.start_new_session_next = self._start_new_session_next
+        bot._state.new_session_project = self._new_session_project
+        bot._state.new_session_expires_at = self._new_session_expires_at
+        bot._state.message_bindings.clear()
+        bot._state.message_bindings.update(self._message_bindings)
 
     def _dispatch(self, text: str) -> StubTransport:
         transport = StubTransport()
@@ -161,6 +170,63 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         with mock.patch.object(bot, "_start_run", fake_start_run):
             self._dispatch("@_user_1 你好")
         self.assertEqual(started, ["你好"])
+
+    def test_reply_routes_to_original_session_without_changing_current(self):
+        other_sid = "feedface12345678"
+        bot._state.sessions[other_sid] = bot.ManagedSession(
+            session_id=other_sid,
+            project_path="/tmp/other",
+            project_label="other",
+            title="原消息会话",
+        )
+        bot._state.current_session_id = self.sid
+        bot._state.current_cwd = "/tmp/p"
+        bot._state.bind_message(
+            "feishu:oc_test_chat:om_original",
+            other_sid,
+            "/tmp/other",
+            "assistant",
+        )
+        started: list[tuple[str, str, str]] = []
+
+        def fake_start_run(prompt, project_path, session_key, session_id):
+            started.append((prompt, project_path, session_id))
+
+        transport = StubTransport()
+        channel.init_feishu(transport)
+        with mock.patch.object(bot, "_start_run", fake_start_run):
+            asyncio.run(bot.dispatch_feishu_text(
+                "ou_test_open_id",
+                "oc_test_chat",
+                "继续修改",
+                transport,
+                reply_message_id="om_original",
+            ))
+
+        self.assertEqual(started, [("继续修改", "/tmp/other", other_sid)])
+        self.assertEqual(bot._state.current_session_id, self.sid)
+        self.assertTrue(any("原消息会话" in text for text in transport.sent))
+
+    def test_unknown_reply_is_not_silently_sent_to_current_session(self):
+        bot._state.current_session_id = self.sid
+        started: list[str] = []
+
+        def fake_start_run(prompt, project_path, session_key, session_id):
+            started.append(session_id)
+
+        transport = StubTransport()
+        channel.init_feishu(transport)
+        with mock.patch.object(bot, "_start_run", fake_start_run):
+            asyncio.run(bot.dispatch_feishu_text(
+                "ou_test_open_id",
+                "oc_test_chat",
+                "继续",
+                transport,
+                reply_message_id="om_missing",
+            ))
+
+        self.assertEqual(started, [])
+        self.assertTrue(any("没有发送" in text for text in transport.sent))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ _chat_id = None        # 你的 chat_id（只给你发）
 _feishu = None         # FeishuTransport 实例（避免 channel 依赖飞书 SDK）
 
 _pending: dict[str, dict] = {}
+_choice_message_refs: dict[str, list[str]] = {}
 _last_status_text = ""
 _last_status_at = 0.0
 
@@ -37,39 +38,43 @@ def init_feishu(transport):
 
 # ---------------- 基础发送 ----------------
 
-async def send_text(text: str, tag: str = ""):
+async def send_text(text: str, tag: str = "") -> list[str]:
     """发文字。Telegram 单条上限 4096 字符，自动分段。
 
     ``tag`` 是来源前缀（如 ``[会话 abc12345]``），多会话并行时用于区分
     消息属于哪个会话；为空则不添加。
     """
     if not text:
-        return
+        return []
     text = text.strip()
     if tag:
         text = f"{tag} {text}"
     if _feishu is not None:
-        await _feishu.send_text(text)
-        return
+        return await _feishu.send_text(text) or []
     if not _bot:
-        return
+        return []
+    refs: list[str] = []
     for i in range(0, len(text), 3500):
         chunk = text[i:i + 3500]
         try:
-            await _bot.send_message(chat_id=_chat_id, text=chunk)
+            message = await _bot.send_message(chat_id=_chat_id, text=chunk)
+            message_id = getattr(message, "message_id", "")
+            if message_id != "":
+                refs.append(f"telegram:{_chat_id}:{message_id}")
         except Exception:
             pass
+    return refs
 
 
-async def send_status(text: str, min_interval: float = 1.5, tag: str = ""):
+async def send_status(text: str, min_interval: float = 1.5, tag: str = "") -> list[str]:
     """发阶段性状态，做一点节流，避免工具消息刷屏。"""
     global _last_status_text, _last_status_at
     now = time.time()
     if text == _last_status_text and (now - _last_status_at) < min_interval:
-        return
+        return []
     _last_status_text = text
     _last_status_at = now
-    await send_text(text, tag=tag)
+    return await send_text(text, tag=tag)
 
 
 async def send_photo(path: str, caption: str = ""):
@@ -121,15 +126,24 @@ async def send_choice_no_wait(text: str, options: list[str], title: str = "需�
     choice_id = uuid.uuid4().hex[:8]
     _pending[choice_id] = {"future": None, "options": options}
 
+    refs: list[str] = []
     if _feishu is not None:
-        await _feishu.send_choice(text, options, choice_id, title=title)
+        refs = await _feishu.send_choice(text, options, choice_id, title=title) or []
     else:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton(label[:32], callback_data=f"pick:{choice_id}:{idx}")] for idx, label in enumerate(options)]
         )
-        await _bot.send_message(chat_id=_chat_id, text=text, reply_markup=keyboard)
+        message = await _bot.send_message(chat_id=_chat_id, text=text, reply_markup=keyboard)
+        message_id = getattr(message, "message_id", "")
+        if message_id != "":
+            refs.append(f"telegram:{_chat_id}:{message_id}")
+    _choice_message_refs[choice_id] = refs
     return choice_id
+
+
+def choice_message_refs(choice_id: str) -> list[str]:
+    return list(_choice_message_refs.get(choice_id, []))
 
 
 async def ask_approval(text: str, timeout: int, timeout_action: str) -> bool:
@@ -149,6 +163,7 @@ def resolve_approval(callback_data: str) -> str | None:
     if kind != "pick":
         return None
     item = _pending.pop(pending_id, None)
+    _choice_message_refs.pop(pending_id, None)
     if not item:
         return None
     fut: asyncio.Future | None = item["future"]
@@ -170,6 +185,7 @@ def resolve_approval(callback_data: str) -> str | None:
 def expire_choice(choice_id: str) -> None:
     """Invalidate a pending choice (called when the wait times out)."""
     _pending.pop(choice_id, None)
+    _choice_message_refs.pop(choice_id, None)
 
 
 async def send_monitor_choices(text: str, choices: list[tuple[str, str]]):
@@ -190,16 +206,19 @@ async def send_monitor_choices(text: str, choices: list[tuple[str, str]]):
     await _bot.send_message(chat_id=_chat_id, text=text[:3500], reply_markup=keyboard)
 
 
-async def send_command_menu():
+async def send_command_menu(has_current_session: bool = True):
     """Send a non-blocking dashboard of common bot actions."""
     choices = [
-        ("📊 当前状态", "dashboard:status"),
-        ("🖥️ 会话监控", "dashboard:monitor"),
-        ("💬 托管会话", "dashboard:sessions"),
-        ("📁 切换项目", "dashboard:project"),
-        ("📋 任务队列", "dashboard:queue"),
+        (
+            "💬 继续当前会话" if has_current_session else "🚀 开始第一个任务",
+            "dashboard:continue" if has_current_session else "dashboard:new",
+        ),
+        ("🔎 选择会话", "dashboard:sessions"),
         ("➕ 新建会话", "dashboard:new"),
-        ("⏹️ 停止任务", "dashboard:stop"),
+        ("📁 切换工作区", "dashboard:project"),
+        ("🟢 查看运行任务", "dashboard:active"),
+        ("📋 任务队列", "dashboard:queue"),
+        ("❓ 帮助与设置", "dashboard:help"),
     ]
     if not _bot and _feishu is None:
         return
@@ -211,7 +230,7 @@ async def send_command_menu():
         [InlineKeyboardButton(label, callback_data=data) for label, data in choices[index:index + 2]]
         for index in range(0, len(choices), 2)
     ])
-    await _bot.send_message(chat_id=_chat_id, text="快捷操作：", reply_markup=keyboard)
+    await _bot.send_message(chat_id=_chat_id, text="请选择操作：", reply_markup=keyboard)
 
 
 async def send_project_choices(
