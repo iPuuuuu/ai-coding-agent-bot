@@ -133,6 +133,7 @@ async def run_turn(
     ctl = _RunControl()
     _active_runs[key] = ctl
     outcome = TurnOutcome(session_id=session_id or "")
+    diagnostics: list[str] = []
     system_prompt = SYSTEM_PROMPT.format(rules=build_supervisor_rules_text())
 
     effective_prompt = f"{system_prompt}\n\n当前用户任务：\n{prompt}"
@@ -162,6 +163,9 @@ async def run_turn(
             line = raw.decode("utf-8", errors="replace").rstrip()
             if not line:
                 continue
+            if not line.lstrip().startswith("{") and line.strip() != "Reading additional input from stdin...":
+                diagnostics.append(line.strip())
+                diagnostics = diagnostics[-8:]
             waiting = await _handle_stream_line(line, outcome, run_key=key, tag=tag)
             if waiting:
                 outcome.state = "waiting"
@@ -170,7 +174,8 @@ async def run_turn(
         if ctl.stop_requested:
             raise asyncio.CancelledError()
         if rc != 0:
-            raise AgentRunnerError(outcome.final_text or f"Codex CLI 退出码 {rc}")
+            detail = outcome.final_text or _diagnostic_summary(diagnostics)
+            raise AgentRunnerError(detail or f"Codex CLI 退出码 {rc}")
 
         await _maybe_send_visual_help(prompt, cwd)
         return outcome
@@ -264,7 +269,8 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome, run_key: str = ""
         if line.strip() == "Reading additional input from stdin...":
             return False
         outcome.events.append(MirrorEvent(kind="raw/non_json", text=line, session_id=outcome.session_id))
-        await channel.send_text(line, tag=tag)
+        # stderr and diagnostics belong in logs/state, never in the user's
+        # conversation.  run_turn keeps the useful tail for one concise error.
         return False
 
     event_type = event.get("type")
@@ -359,6 +365,16 @@ async def _handle_stream_line(line: str, outcome: TurnOutcome, run_key: str = ""
     # Unrecognized internal events (item.started etc.) are ignored entirely:
     # they are neither forwarded to the phone nor kept in the transcript.
     return False
+
+
+def _diagnostic_summary(lines: list[str]) -> str:
+    """Return one compact CLI failure reason without flooding the chat."""
+    cleaned: list[str] = []
+    for line in lines:
+        text = " ".join(str(line).split())
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return " | ".join(cleaned[-3:])[:1200]
 
 
 async def _maybe_send_visual_help(prompt: str, cwd: str):

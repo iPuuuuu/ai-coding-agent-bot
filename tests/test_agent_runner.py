@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest import mock
 
 import agent_runner
 import channel
@@ -167,6 +168,71 @@ class StreamNoiseTest(unittest.TestCase):
         finally:
             channel.send_status = original
         self.assertEqual(sent, [])
+
+    def test_cli_diagnostic_is_recorded_but_not_forwarded(self):
+        sent: list[str] = []
+        original = channel.send_text
+
+        async def fake_send_text(text: str, tag: str = ""):
+            sent.append(text)
+
+        channel.send_text = fake_send_text
+        try:
+            async def run():
+                outcome = agent_runner.TurnOutcome()
+                await agent_runner._handle_stream_line(
+                    "thread-store conflict: thread abc already has an active writer",
+                    outcome,
+                )
+                return outcome
+
+            outcome = asyncio.run(run())
+        finally:
+            channel.send_text = original
+        self.assertEqual(sent, [])
+        self.assertEqual(outcome.events[-1].kind, "raw/non_json")
+
+    def test_diagnostic_summary_is_compact_and_deduplicated(self):
+        summary = agent_runner._diagnostic_summary(["boom", "boom", "active writer"])
+        self.assertEqual(summary, "boom | active writer")
+
+    def test_nonzero_process_surfaces_diagnostic_without_forwarding_noise(self):
+        class FakeStdout:
+            def __init__(self):
+                self._lines = iter([
+                    b"thread-store conflict: thread abc already has an active writer\n"
+                ])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._lines)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        class FakeProcess:
+            stdout = FakeStdout()
+            returncode = 1
+
+            async def wait(self):
+                return 1
+
+        async def fake_create(*args, **kwargs):
+            return FakeProcess()
+
+        async def run():
+            with (
+                mock.patch.object(agent_runner, "_ensure_codex_available", mock.AsyncMock()),
+                mock.patch.object(asyncio, "create_subprocess_exec", side_effect=fake_create),
+                mock.patch.object(channel, "send_text", mock.AsyncMock()) as send_text,
+            ):
+                with self.assertRaisesRegex(agent_runner.AgentRunnerError, "active writer"):
+                    await agent_runner.run_turn("hello", "/tmp", session_id="abc")
+                send_text.assert_not_awaited()
+
+        asyncio.run(run())
 
     def test_agent_text_forwarded_live_and_tracked(self):
         sent: list[str] = []

@@ -26,4 +26,4 @@ if kill -0 "$PID" 2>/dev/null; then
   kill -9 "$PID" || true
 fi
 rm -f logs/bot.pid
-echo "bot 已停止（PID $PID）"
+echo "bot 已停止（PID ${PID}）"

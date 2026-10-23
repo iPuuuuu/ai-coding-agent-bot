@@ -61,6 +61,7 @@ class StatePersistenceTest(unittest.TestCase):
         self.assertEqual(restored.sessions["sess-123"].title, "初始任务")
         self.assertEqual(restored.sessions["sess-123"].mode, "idle")  # never restore as live
         self.assertEqual(restored.current_session_id, "sess-123")
+        self.assertFalse(restored.selection_confirmed)
         self.assertEqual(restored.project_last_session.get("/tmp/p1"), "sess-123")
         self.assertEqual(len(restored.task_queue), 3)
         self.assertEqual(restored.task_queue[0].task_number, 9)
@@ -77,6 +78,12 @@ class StatePersistenceTest(unittest.TestCase):
         restored = bot.RuntimeState()
         bot._apply_state(restored, {"sessions": "not-a-list", "projects": None})
         self.assertEqual(len(restored.sessions), 0)
+
+    def test_technical_event_is_not_used_as_session_title(self):
+        self.assertEqual(
+            bot._clean_session_title("task_complete", "demo", "abcdef1234"),
+            "demo 会话 abcd",
+        )
 
     def test_new_session_draft_round_trip(self):
         source = bot.RuntimeState()

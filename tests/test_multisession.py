@@ -214,7 +214,8 @@ class SessionCardsTest(unittest.TestCase):
             cards = bot._build_session_cards()
         self.assertEqual(len(cards), 1)
         card = cards[0]
-        self.assertIn("task_complete", card["title"])
+        self.assertNotIn("task_complete", card["title"])
+        self.assertIn("会话", card["title"])
         self.assertIn("已完成", card["title"])
         self.assertIn("📁 proj", card["subtitle"])
         labels = [label for label, _ in card["buttons"]]

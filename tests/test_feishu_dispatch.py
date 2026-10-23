@@ -56,6 +56,7 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         self._tasks = dict(bot._running_tasks)
         self._current_cwd = bot._state.current_cwd
         self._current_session_id = bot._state.current_session_id
+        self._selection_confirmed = bot._state.selection_confirmed
         self._start_new_session_next = bot._state.start_new_session_next
         self._new_session_project = bot._state.new_session_project
         self._new_session_expires_at = bot._state.new_session_expires_at
@@ -66,6 +67,7 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         bot._state.pending_by_session.clear()
         bot._state.cancel_new_session()
         bot._state.message_bindings.clear()
+        bot._state.selection_confirmed = False
         self.sid = "deadbeef12345678"
         bot._state.sessions[self.sid] = bot.ManagedSession(
             session_id=self.sid, project_path="/tmp/p", project_label="p", title="冒烟会话"
@@ -83,6 +85,7 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         bot._state.pending_by_session.clear()
         bot._state.set_current_project(self._current_cwd)
         bot._state.current_session_id = self._current_session_id
+        bot._state.selection_confirmed = self._selection_confirmed
         bot._state.start_new_session_next = self._start_new_session_next
         bot._state.new_session_project = self._new_session_project
         bot._state.new_session_expires_at = self._new_session_expires_at
@@ -159,9 +162,33 @@ class FeishuDispatchSmokeTest(unittest.TestCase):
         self.assertEqual(started, [("帮我改一下配置", self.sid)])
         self.assertTrue(any("已开始任务" in text for text in transport.sent))
 
+    def test_unconfirmed_restored_session_does_not_receive_plain_message(self):
+        bot._state.current_session_id = self.sid
+        bot._state.current_cwd = "/tmp/p"
+        bot._state.selection_confirmed = False
+        started: list[str] = []
+
+        with mock.patch.object(bot, "_start_run", lambda *args: started.append(args[0])):
+            transport = self._dispatch("继续")
+
+        self.assertEqual(started, [])
+        self.assertTrue(any("这条消息尚未发送" in text for text in transport.sent))
+        self.assertTrue(any(card["kind"] == "sessions" for card in transport.cards))
+
+    def test_writer_conflict_has_one_actionable_message(self):
+        text, conflict = bot._friendly_agent_error(
+            bot.agent_runner.AgentRunnerError(
+                "thread-store conflict: thread abc already has an active writer"
+            )
+        )
+        self.assertTrue(conflict)
+        self.assertIn("另一个 Codex 窗口", text)
+        self.assertNotIn("thread-store", text)
+
     def test_mention_placeholder_stripped(self):
         bot._state.current_session_id = self.sid
         bot._state.current_cwd = "/tmp/p"
+        bot._state.selection_confirmed = True
         started: list[str] = []
 
         def fake_start_run(prompt, project_path, session_key, session_id):

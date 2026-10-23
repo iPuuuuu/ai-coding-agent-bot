@@ -54,6 +54,22 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "state.json")
+_TECHNICAL_SESSION_TITLES = {
+    "task_complete", "task_started", "turn_aborted", "item_completed",
+    "unknown", "completed", "running", "stale", "新会话",
+}
+
+
+def _clean_session_title(raw: str, project_label: str, session_id: str) -> str:
+    """Return a human-readable title; never expose event names as titles."""
+    title = " ".join(str(raw or "").strip().split())
+    if (
+        not title
+        or title.lower() in _TECHNICAL_SESSION_TITLES
+        or not any(char.isalnum() for char in title)
+    ):
+        return f"{project_label} 会话 {session_id[:4]}".strip()
+    return title[:36]
 
 
 @dataclass
@@ -142,6 +158,7 @@ class ProjectSnapshot:
 class RuntimeState:
     current_cwd: str = config.DEFAULT_PROJECT_DIR
     current_session_id: str = ""
+    selection_confirmed: bool = False
     mode: str = "idle"
     active_prompt: str = ""
     started_at: Optional[float] = None
@@ -182,6 +199,7 @@ class RuntimeState:
         session_id = self.project_last_session.get(norm, "")
         if session_id and session_id in self.sessions:
             self.current_session_id = session_id
+        self.selection_confirmed = False
         self.last_event = f"切换项目：{snap.label}"
         snap.last_event = self.last_event
         snap.last_active_at = time.time()
@@ -192,6 +210,7 @@ class RuntimeState:
         norm = _norm_path(project_path)
         self.set_current_project(norm)
         self.current_session_id = ""
+        self.selection_confirmed = False
         self.start_new_session_next = True
         self.new_session_project = norm
         self.new_session_expires_at = time.time() + ttl_seconds
@@ -231,7 +250,7 @@ class RuntimeState:
         snap = self.ensure_project(norm)
         session = self.sessions.get(session_id)
         if session is None:
-            title = (initial_prompt or "新会话").strip()[:48] or "新会话"
+            title = _clean_session_title(initial_prompt, snap.label, session_id)
             session = ManagedSession(
                 session_id=session_id,
                 project_path=norm,
@@ -247,6 +266,7 @@ class RuntimeState:
         self.project_last_session[norm] = session_id
         if set_focus:
             self.current_session_id = session_id
+            self.selection_confirmed = True
         return session
 
     def set_pending(self, pending: PendingInteraction) -> None:
@@ -607,7 +627,11 @@ def _apply_state(state: RuntimeState, data: dict) -> None:
             session_id=session_id,
             project_path=_norm_path(item.get("project_path", config.DEFAULT_PROJECT_DIR)),
             project_label=str(item.get("project_label") or _project_label(item.get("project_path", ""))),
-            title=str(item.get("title") or "新会话")[:48],
+            title=_clean_session_title(
+                str(item.get("title") or item.get("last_prompt") or ""),
+                str(item.get("project_label") or _project_label(item.get("project_path", ""))),
+                session_id,
+            ),
             created_at=float(item.get("created_at", time.time()) or time.time()),
             updated_at=float(item.get("updated_at", time.time()) or time.time()),
             last_prompt=str(item.get("last_prompt", "")),
@@ -686,6 +710,7 @@ def _apply_state(state: RuntimeState, data: dict) -> None:
     current_session_id = str(data.get("current_session_id") or "")
     if current_session_id in state.sessions:
         state.current_session_id = current_session_id
+        state.selection_confirmed = False
         state.sessions[current_session_id].mode = "idle"
         state.sessions[current_session_id].last_event += "（重启恢复）"
     new_session_project = str(data.get("new_session_project") or "")
@@ -962,7 +987,10 @@ def _format_home() -> str:
     else:
         status = _session_status_label(session.mode)
         session_line = f"💬 当前会话：{session.title}"
-        status_line = f"{('🟡' if session.mode == 'waiting_user_reply' else '🟢' if session.mode == 'running' else '⚪')} {status}"
+        if not _state.selection_confirmed:
+            status_line = "🟡 重启后需要你确认，普通消息暂不会发送"
+        else:
+            status_line = f"{('🟡' if session.mode == 'waiting_user_reply' else '🟢' if session.mode == 'running' else '⚪')} {status}"
         progress = f"\n最近进展：{session.last_event[:80]}" if session.last_event else ""
     draft = ""
     if _state.new_session_pending():
@@ -1095,7 +1123,11 @@ def _adopt_global_session(session_id: str, set_focus: bool = True) -> ManagedSes
         cwd = _norm_path(item.get("cwd", config.DEFAULT_PROJECT_DIR) or config.DEFAULT_PROJECT_DIR)
         _state.ensure_project(cwd)
         session = _state.bind_session(session_id, cwd, set_focus=set_focus)
-        session.title = str(item.get("last_text") or item.get("last_event") or session.title)[:48] or session.title
+        session.title = _clean_session_title(
+            item.get("last_text") or item.get("last_event") or session.title,
+            session.project_label,
+            session_id,
+        )
         session.mode = "waiting_user_reply" if item.get("waiting") else item.get("status", "active")
         session.last_event = str(item.get("last_event", session.last_event))
         session.updated_at = float(item.get("updated_at", time.time()) or time.time())
@@ -1118,7 +1150,11 @@ def _adopt_global_session(session_id: str, set_focus: bool = True) -> ManagedSes
         cwd = _norm_path(codex_item.get("cwd") or config.DEFAULT_PROJECT_DIR)
         _state.ensure_project(cwd)
         session = _state.bind_session(session_id, cwd, set_focus=set_focus)
-        session.title = str(codex_item.get("title") or codex_item.get("last_event") or session.title)[:48] or session.title
+        session.title = _clean_session_title(
+            codex_item.get("title") or codex_item.get("last_event") or session.title,
+            session.project_label,
+            session_id,
+        )
         session.mode = str(codex_item.get("status", "unknown"))
         session.last_event = str(codex_item.get("last_event") or session.last_event)
         session.updated_at = float(codex_item.get("updated_at", time.time()) or time.time())
@@ -1353,7 +1389,11 @@ def _build_session_cards(project_path: str = "") -> list[dict]:
         running = status in {"running", "active"} or live_task
         waiting = status in {"waiting", "waiting_user_reply"} or session_id in _state.pending_by_session
         icon = "👉" if is_focus else ("🟢" if running else ("🟡" if waiting else "•"))
-        display_title = str(item.get("title") or item.get("last_text") or event or f"会话 {session_id[:8]}")[:48]
+        display_title = _clean_session_title(
+            item.get("title") or item.get("last_text") or event,
+            project,
+            session_id,
+        )
         title = f"{icon} {display_title} · {status_label}"
         subtitle = f"📁 {project}\n最近进展：{event}"
         if managed:
@@ -1580,6 +1620,8 @@ async def _run_agent(prompt: str, project_path: str, session_key: str, session_i
             # target, or it created a brand-new session for the current project.
             if _state.current_session_id == active_session_id or session_key.startswith("new:"):
                 _state.current_session_id = active_session_id
+                if session_key.startswith("new:"):
+                    _state.selection_confirmed = True
         if outcome.state == "waiting":
             pending = PendingInteraction(
                 project_path=project_path,
@@ -1654,13 +1696,20 @@ async def _run_agent(prompt: str, project_path: str, session_key: str, session_i
     except Exception as e:
         log.exception("run_agent failed")
         _prune_managed_waiting_notice(session_id)
-        _state.mark_error(f"Agent 运行出错：{type(e).__name__}: {e}", project_path, session_id)
+        friendly, is_writer_conflict = _friendly_agent_error(e)
+        _state.mark_error(friendly, project_path, session_id)
+        if is_writer_conflict and _state.current_session_id == session_id:
+            _state.selection_confirmed = False
+        failure_label = "未发送" if is_writer_conflict else "执行未完成"
         refs = await channel.send_text(
-            f"🔴「{_session_name(session_id)}」执行失败\n原因：{type(e).__name__}: {e}\n"
-            "会话上下文已保留，可以稍后继续。",
+            f"🔴「{_session_name(session_id)}」{failure_label}\n{friendly}",
             tag=tag,
         )
         _bind_message_refs(refs, session_id, project_path, "error")
+        if is_writer_conflict:
+            cards = _build_session_cards(project_path)
+            if cards:
+                await channel.send_session_cards("请选择其他会话，或新建会话：", cards)
     finally:
         heartbeat.cancel()
         _running_tasks.pop(session_key, None)
@@ -1669,6 +1718,21 @@ async def _run_agent(prompt: str, project_path: str, session_key: str, session_i
             snap.mode = "idle"
         _refresh_global_mode()
         await _drain_queues()
+
+
+def _friendly_agent_error(error: Exception) -> tuple[str, bool]:
+    """Map infrastructure failures to one actionable user-facing message."""
+    detail = " ".join(str(error).split())
+    lowered = detail.lower()
+    if "active writer" in lowered or "thread-store conflict" in lowered:
+        return (
+            "这个会话正在电脑上的另一个 Codex 窗口中使用。"
+            "为避免内容冲突，这条消息没有发送；请在原窗口继续，或在 Bot 里新建会话。",
+            True,
+        )
+    if "not found" in lowered and "session" in lowered:
+        return "原会话已不可用，这条消息没有发送。请新建会话后重试。", False
+    return "本次执行失败，这条消息没有完成。会话内容已保留，请稍后重试。", False
 
 
 async def _heartbeat_loop(snap: ProjectSnapshot, prompt: str, started_at: float, run_key: str, tag: str = ""):
@@ -1809,6 +1873,7 @@ async def cmd_use(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     _state.set_current_project(session.project_path)
     _state.current_session_id = session_id
+    _state.selection_confirmed = True
     _state.cancel_new_session()
     await update.message.reply_text(
         f"✓ 已设为当前会话「{session.title}」\n"
@@ -2175,6 +2240,7 @@ async def _handle_session_action(query):
             return
         _state.set_current_project(session.project_path)
         _state.current_session_id = session_id
+        _state.selection_confirmed = True
         _state.cancel_new_session()
         await query.edit_message_text(
             f"✓ 已设为当前会话「{session.title}」\n"
@@ -2203,6 +2269,7 @@ async def _handle_session_action(query):
             return
         _state.set_current_project(session.project_path)
         _state.current_session_id = session_id
+        _state.selection_confirmed = True
         _state.cancel_new_session()
         await query.edit_message_text(
             f"✓ 已接管并设为当前会话「{session.title}」\n"
@@ -2270,6 +2337,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 _state.cancel_new_session()
                 _state.set_current_project(target_path)
                 _state.current_session_id = routed_session_id
+                _state.selection_confirmed = True
             if not prompt:
                 # "@<id>" 单独一条 = 仅切换焦点
                 session = _state.sessions[routed_session_id]
@@ -2292,6 +2360,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             target_session_id = routed_session_id
 
         force_new = _state.new_session_pending()
+        if target_session_id and not routed and not reply_routed and not _state.selection_confirmed:
+            await update.message.reply_text(
+                f"为避免发错，重启后需要先确认会话「{_session_name(target_session_id)}」。\n"
+                "这条消息尚未发送，请点击下方“继续”或选择其他会话。"
+            )
+            cards = _build_session_cards(_state.current_cwd)
+            if cards:
+                await channel.send_session_cards("请选择发送目标：", cards)
+            return
         if not target_session_id and not force_new:
             await update.message.reply_text(
                 "还没有明确发送目标。请选择一个会话，或先新建会话；这条消息尚未发送。"
